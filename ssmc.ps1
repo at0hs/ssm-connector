@@ -129,9 +129,8 @@ try {
         }
 
         if ($candidates.Count -eq 1 -and ($request.TargetName -or $request.TargetInstanceId)) {
-            # 本番への誤接続を防ぐため、1 件に決まっても確認する
+            # 接続先を明示的に指定しているので、1 件に決まれば確認せずに接続する
             $selected = $candidates[0]
-            if (-not (Read-SsmcConfirmation -Message "$(Get-SsmcInstanceDisplayName $selected) ($($selected.InstanceId)) に接続しますか？")) { return }
         } else {
             $selected = Show-SsmcMenu -Title "[$($selectedEnvironment.DisplayName)] 接続先を選択" -Items @(ConvertTo-SsmcInstanceMenuItem -Instances $candidates)
             if ($null -eq $selected) { return }
