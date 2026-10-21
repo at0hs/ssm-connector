@@ -641,3 +641,88 @@ function Invoke-SsmcWithCredential {
     }
 }
 #endregion
+
+#region Inventory
+function Get-SsmcInstance {
+    param([Parameter(Mandatory)][string]$Region)
+    $ec2 = Invoke-Aws -Arguments @('ec2', 'describe-instances', '--region', $Region, '--filters', 'Name=instance-state-name,Values=running', '--output', 'json')
+    if ($ec2.ExitCode -ne 0) {
+        throw (New-SsmcException -Message "EC2 インスタンス一覧の取得に失敗しました: $($ec2.StdErr.Trim())" -ExitCode 3)
+    }
+    $instances = @(foreach ($reservation in @((ConvertFrom-SsmcAwsJson $ec2.StdOut).Reservations)) {
+            foreach ($instance in @($reservation.Instances)) {
+                # Tags を 1 つも持たないインスタンスは、JSON に Tags 自体が含まれない
+                $tags = @()
+                if ($instance.PSObject.Properties['Tags']) { $tags = @($instance.Tags) }
+                $nameTag = $tags | Where-Object { $_.Key -eq 'Name' } | Select-Object -First 1
+                $name = $null
+                if ($null -ne $nameTag) { $name = $nameTag.Value }
+                [pscustomobject]@{ Name = $name; InstanceId = $instance.InstanceId; PrivateIp = $instance.PrivateIpAddress; PingStatus = $null }
+            }
+        })
+
+    $ssm = Invoke-Aws -Arguments @('ssm', 'describe-instance-information', '--region', $Region, '--output', 'json')
+    $statusMap = $null
+    if ($ssm.ExitCode -eq 0) {
+        $statusMap = @{}
+        foreach ($information in @((ConvertFrom-SsmcAwsJson $ssm.StdOut).InstanceInformationList)) {
+            $statusMap[$information.InstanceId] = $information.PingStatus
+        }
+    } elseif ((Get-SsmcAwsErrorKind $ssm.StdErr) -eq 'AccessDenied') {
+        Write-SsmcVerbose "SSM の状態を取得する権限がないため、状態の表示を省略します: $($ssm.StdErr.Trim())"
+    } else {
+        throw (New-SsmcException -Message "SSM 管理情報の取得に失敗しました: $($ssm.StdErr.Trim())" -ExitCode 3)
+    }
+    Merge-SsmcInstanceStatus -Instances $instances -StatusMap $statusMap
+}
+
+function Merge-SsmcInstanceStatus {
+    param(
+        [AllowEmptyCollection()][object[]]$Instances = @(),
+        [hashtable]$StatusMap
+    )
+    $merged = @(foreach ($instance in $Instances) {
+            $status = $null
+            if ($null -ne $StatusMap) {
+                $status = '未登録'
+                if ($StatusMap.ContainsKey($instance.InstanceId)) { $status = $StatusMap[$instance.InstanceId] }
+            }
+            [pscustomobject]@{ Name = $instance.Name; InstanceId = $instance.InstanceId; PrivateIp = $instance.PrivateIp; PingStatus = $status }
+        })
+    $merged | Where-Object { $_.Name } | Sort-Object Name, InstanceId
+    $merged | Where-Object { -not $_.Name } | Sort-Object InstanceId
+}
+
+function Select-SsmcInstanceByTarget {
+    param(
+        [AllowEmptyCollection()][object[]]$Instances = @(),
+        [string]$TargetName,
+        [string]$TargetInstanceId
+    )
+    if ($TargetInstanceId) { return ($Instances | Where-Object { $_.InstanceId -eq $TargetInstanceId }) }
+    if ($TargetName) { return ($Instances | Where-Object { $_.Name -eq $TargetName }) }
+    return $Instances
+}
+
+function Get-SsmcInstanceDisplayName {
+    param([Parameter(Mandatory)]$Instance)
+    if ($Instance.Name) { return $Instance.Name }
+    return '<Nameタグなし>'
+}
+
+function ConvertTo-SsmcInstanceMenuItem {
+    param([Parameter(Mandatory)][object[]]$Instances)
+    $nameWidth = ($Instances | ForEach-Object { (Get-SsmcInstanceDisplayName $_).Length } | Measure-Object -Maximum).Maximum
+    foreach ($instance in $Instances) {
+        $name = Get-SsmcInstanceDisplayName $instance
+        $label = '{0}  {1}  {2}' -f $name.PadRight($nameWidth), $instance.InstanceId.PadRight(19), ([string]$instance.PrivateIp).PadRight(15)
+        if ($null -ne $instance.PingStatus) { $label += '  ' + $instance.PingStatus }
+        [pscustomobject]@{
+            Label      = $label.TrimEnd()
+            SearchText = "$name $($instance.InstanceId) $($instance.PrivateIp)"
+            Dim        = ($null -ne $instance.PingStatus -and $instance.PingStatus -ne 'Online')
+            Value      = $instance
+        }
+    }
+}
+#endregion

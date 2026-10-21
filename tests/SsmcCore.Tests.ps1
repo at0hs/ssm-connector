@@ -543,3 +543,111 @@ Describe 'Auth: Invoke-SsmcWithCredential' {
         $env:AWS_PROFILE | Should -Be 'original-profile'
     }
 }
+
+Describe 'Inventory: Merge-SsmcInstanceStatus' {
+    BeforeAll {
+        $instances = @(
+            [pscustomobject]@{ Name = 'web01'; InstanceId = 'i-0000000000000000b'; PrivateIp = '10.0.1.20'; PingStatus = $null }
+            [pscustomobject]@{ Name = $null; InstanceId = 'i-0000000000000000c'; PrivateIp = '10.0.1.30'; PingStatus = $null }
+            [pscustomobject]@{ Name = 'app01'; InstanceId = 'i-0000000000000000a'; PrivateIp = '10.0.1.10'; PingStatus = $null }
+        )
+    }
+    It 'Name の昇順に並べ、Name のないものは末尾に置く' {
+        $result = @(Merge-SsmcInstanceStatus -Instances $instances -StatusMap @{})
+        ($result | ForEach-Object { $_.InstanceId }) -join ',' | Should -Be 'i-0000000000000000a,i-0000000000000000b,i-0000000000000000c'
+    }
+    It 'SSM の状態を付け、含まれないものは未登録にする' {
+        $result = @(Merge-SsmcInstanceStatus -Instances $instances -StatusMap @{ 'i-0000000000000000a' = 'Online'; 'i-0000000000000000b' = 'ConnectionLost' })
+        $result[0].PingStatus | Should -Be 'Online'
+        $result[1].PingStatus | Should -Be 'ConnectionLost'
+        $result[2].PingStatus | Should -Be '未登録'
+    }
+    It 'StatusMap が $null なら状態は $null のまま' {
+        $result = @(Merge-SsmcInstanceStatus -Instances $instances -StatusMap $null)
+        $result[0].PingStatus | Should -BeNullOrEmpty
+    }
+    It '0 件なら何も返さない' {
+        @(Merge-SsmcInstanceStatus -Instances @() -StatusMap @{}).Count | Should -Be 0
+    }
+}
+
+Describe 'Inventory: Get-SsmcInstance' {
+    BeforeAll {
+        $ec2Json = @'
+{"Reservations":[
+  {"Instances":[{"InstanceId":"i-0000000000000000b","PrivateIpAddress":"10.0.1.20","Tags":[{"Key":"Name","Value":"web01"},{"Key":"Env","Value":"prod"}]}]},
+  {"Instances":[{"InstanceId":"i-0000000000000000c","PrivateIpAddress":"10.0.1.30"}]}
+]}
+'@
+        $ssmJson = '{"InstanceInformationList":[{"InstanceId":"i-0000000000000000b","PingStatus":"Online"}]}'
+    }
+    It 'EC2 と SSM の情報を結合する' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $ec2Json; StdErr = '' } } -ParameterFilter { $Arguments[0] -eq 'ec2' }
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $ssmJson; StdErr = '' } } -ParameterFilter { $Arguments[0] -eq 'ssm' }
+        $result = @(Get-SsmcInstance -Region 'ap-northeast-1')
+        $result.Count | Should -Be 2
+        $result[0].Name | Should -Be 'web01'
+        $result[0].PingStatus | Should -Be 'Online'
+        $result[1].Name | Should -BeNullOrEmpty
+        $result[1].PingStatus | Should -Be '未登録'
+        Should -Invoke -ModuleName SsmcCore Invoke-Aws -ParameterFilter { ($Arguments -join ' ') -eq 'ec2 describe-instances --region ap-northeast-1 --filters Name=instance-state-name,Values=running --output json' }
+    }
+    It '1 件だけでも配列として扱える' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = '{"Reservations":[{"Instances":[{"InstanceId":"i-0000000000000000b","PrivateIpAddress":"10.0.1.20"}]}]}'; StdErr = '' } } -ParameterFilter { $Arguments[0] -eq 'ec2' }
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $ssmJson; StdErr = '' } } -ParameterFilter { $Arguments[0] -eq 'ssm' }
+        @(Get-SsmcInstance -Region 'ap-northeast-1').Count | Should -Be 1
+    }
+    It '稼働中のインスタンスがなければ何も返さない' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = '{"Reservations":[]}'; StdErr = '' } } -ParameterFilter { $Arguments[0] -eq 'ec2' }
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = '{"InstanceInformationList":[]}'; StdErr = '' } } -ParameterFilter { $Arguments[0] -eq 'ssm' }
+        @(Get-SsmcInstance -Region 'ap-northeast-1').Count | Should -Be 0
+    }
+    It 'SSM の権限がなければ状態なしで続行する' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $ec2Json; StdErr = '' } } -ParameterFilter { $Arguments[0] -eq 'ec2' }
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'An error occurred (AccessDeniedException) when calling the DescribeInstanceInformation operation' } } -ParameterFilter { $Arguments[0] -eq 'ssm' }
+        $result = @(Get-SsmcInstance -Region 'ap-northeast-1')
+        $result.Count | Should -Be 2
+        $result[0].PingStatus | Should -BeNullOrEmpty
+    }
+    It 'SSM がそれ以外の理由で失敗したら終了コード 3 で失敗する' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $ec2Json; StdErr = '' } } -ParameterFilter { $Arguments[0] -eq 'ec2' }
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 255; StdOut = ''; StdErr = 'Could not connect to the endpoint URL' } } -ParameterFilter { $Arguments[0] -eq 'ssm' }
+        $err = { Get-SsmcInstance -Region 'ap-northeast-1' } | Should -Throw -ExpectedMessage '*SSM*' -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 3
+    }
+    It 'EC2 の取得に失敗したら終了コード 3 で失敗する' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'An error occurred (UnauthorizedOperation)' } } -ParameterFilter { $Arguments[0] -eq 'ec2' }
+        $err = { Get-SsmcInstance -Region 'ap-northeast-1' } | Should -Throw -ExpectedMessage '*EC2*UnauthorizedOperation*' -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 3
+    }
+}
+
+Describe 'Inventory: Select-SsmcInstanceByTarget / ConvertTo-SsmcInstanceMenuItem' {
+    BeforeAll {
+        $instances = @(
+            [pscustomobject]@{ Name = 'web01'; InstanceId = 'i-0000000000000000a'; PrivateIp = '10.0.1.10'; PingStatus = 'Online' }
+            [pscustomobject]@{ Name = 'web01'; InstanceId = 'i-0000000000000000b'; PrivateIp = '10.0.1.11'; PingStatus = 'ConnectionLost' }
+            [pscustomobject]@{ Name = $null; InstanceId = 'i-0000000000000000c'; PrivateIp = '10.0.1.12'; PingStatus = $null }
+        )
+    }
+    It 'Name で絞り込む（大文字小文字を区別しない）' {
+        @(Select-SsmcInstanceByTarget -Instances $instances -TargetName 'WEB01').Count | Should -Be 2
+    }
+    It 'インスタンス ID で絞り込む' {
+        @(Select-SsmcInstanceByTarget -Instances $instances -TargetInstanceId 'i-0000000000000000c').Count | Should -Be 1
+    }
+    It '指定がなければすべて返す' {
+        @(Select-SsmcInstanceByTarget -Instances $instances).Count | Should -Be 3
+    }
+    It 'メニュー項目に変換する' {
+        $items = @(ConvertTo-SsmcInstanceMenuItem -Instances $instances)
+        $items[0].Label | Should -Match 'web01\s+i-0000000000000000a\s+10\.0\.1\.10\s+Online'
+        $items[0].Dim | Should -BeFalse
+        $items[1].Dim | Should -BeTrue
+        $items[2].Label | Should -Match '<Nameタグなし>'
+        $items[2].Label | Should -Not -Match 'Online|ConnectionLost'
+        $items[2].Dim | Should -BeFalse
+        $items[0].SearchText | Should -Match '10\.0\.1\.10'
+        $items[0].Value.InstanceId | Should -Be 'i-0000000000000000a'
+    }
+}
