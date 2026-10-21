@@ -651,3 +651,79 @@ Describe 'Inventory: Select-SsmcInstanceByTarget / ConvertTo-SsmcInstanceMenuIte
         $items[0].Value.InstanceId | Should -Be 'i-0000000000000000a'
     }
 }
+
+Describe 'Session: Get-SsmcSessionArgument' {
+    BeforeAll {
+        function New-TestRequest {
+            param([string]$Type = 'shell', $RemoteHost = $null, $RemotePort = $null, $LocalPort = $null)
+            [pscustomobject]@{ EnvKey = 'prod'; TargetName = $null; TargetInstanceId = $null; Type = $Type; RemoteHost = $RemoteHost; RemotePort = $RemotePort; LocalPort = $LocalPort }
+        }
+    }
+    It 'シェル接続の引数を作る' {
+        (Get-SsmcSessionArgument -InstanceId 'i-0000000000000000a' -Region 'ap-northeast-1' -Request (New-TestRequest)) -join ' ' |
+            Should -Be 'ssm start-session --target i-0000000000000000a --region ap-northeast-1'
+    }
+    It 'インスタンス自身へのポートフォワードの引数を作る' {
+        (Get-SsmcSessionArgument -InstanceId 'i-0000000000000000a' -Region 'ap-northeast-1' -Request (New-TestRequest -Type 'portForward' -RemotePort 3389 -LocalPort 13389)) -join ' ' |
+            Should -Be 'ssm start-session --target i-0000000000000000a --region ap-northeast-1 --document-name AWS-StartPortForwardingSession --parameters portNumber=3389,localPortNumber=13389'
+    }
+    It '別ホストへのポートフォワードの引数を作る' {
+        (Get-SsmcSessionArgument -InstanceId 'i-0000000000000000a' -Region 'ap-northeast-1' -Request (New-TestRequest -Type 'portForward' -RemoteHost 'mydb' -RemotePort 5432 -LocalPort 15432)) -join ' ' |
+            Should -Be 'ssm start-session --target i-0000000000000000a --region ap-northeast-1 --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters host=mydb,portNumber=5432,localPortNumber=15432'
+    }
+}
+
+Describe 'Session: Test-SsmcLocalPortAvailable' {
+    It '使用中のポートは false、解放後は true' {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        $port = $listener.LocalEndpoint.Port
+        try {
+            Test-SsmcLocalPortAvailable -Port $port | Should -BeFalse
+        } finally {
+            $listener.Stop()
+        }
+        Test-SsmcLocalPortAvailable -Port $port | Should -BeTrue
+    }
+}
+
+Describe 'Session: Start-SsmcSession' {
+    BeforeAll {
+        $instance = [pscustomobject]@{ Name = 'web01'; InstanceId = 'i-0000000000000000a'; PrivateIp = '10.0.1.10'; PingStatus = 'Online' }
+        $request = [pscustomobject]@{ EnvKey = 'prod'; TargetName = $null; TargetInstanceId = $null; Type = 'shell'; RemoteHost = $null; RemotePort = $null; LocalPort = $null }
+    }
+    BeforeEach { Mock -ModuleName SsmcCore Write-Host { } }
+    It 'start-session を対話モードで実行する' {
+        Mock -ModuleName SsmcCore Invoke-AwsInteractive { 0 }
+        { Start-SsmcSession -Instance $instance -Region 'ap-northeast-1' -Request $request } | Should -Not -Throw
+        Should -Invoke -ModuleName SsmcCore Invoke-AwsInteractive -Times 1 -ParameterFilter { $Arguments[1] -eq 'start-session' }
+    }
+    It '失敗したら終了コード 3 で失敗する' {
+        Mock -ModuleName SsmcCore Invoke-AwsInteractive { 255 }
+        $err = { Start-SsmcSession -Instance $instance -Region 'ap-northeast-1' -Request $request } | Should -Throw -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 3
+    }
+}
+
+Describe 'Help: Get-SsmcHelpText' {
+    It '設定がなければ使い方だけを返す' {
+        $text = Get-SsmcHelpText -Config $null
+        $text | Should -Match '使い方: ssmc'
+        $text | Should -Not -Match '環境:'
+    }
+    It '環境とプリセットの一覧を含める' {
+        $shared = [ordered]@{
+            version      = 1
+            defaults     = [ordered]@{ region = 'ap-northeast-1'; credentialTtlMinutes = 60 }
+            environments = [ordered]@{ prod = [ordered]@{ displayName = '本番'; roleArn = 'arn:aws:iam::333333333333:role/Operator' } }
+        }
+        $user = [ordered]@{ presets = [ordered]@{
+            'prod-web01' = [ordered]@{ env = 'prod'; target = [ordered]@{ name = 'web01' } }
+            'prod-db'    = [ordered]@{ env = 'prod'; target = [ordered]@{ name = 'bastion01' }; type = 'portForward'; remoteHost = 'mydb'; remotePort = 5432; localPort = 15432 }
+        } }
+        $text = Get-SsmcHelpText -Config (Merge-SsmcConfig -Shared $shared -User $user)
+        $text | Should -Match 'prod\s+本番'
+        $text | Should -Match 'prod-web01\s+本番 / web01 / shell'
+        $text | Should -Match 'prod-db\s+本番 / bastion01 / portForward 15432 -> mydb:5432'
+    }
+}

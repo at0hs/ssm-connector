@@ -726,3 +726,110 @@ function ConvertTo-SsmcInstanceMenuItem {
     }
 }
 #endregion
+
+#region Session
+function Get-SsmcSessionArgument {
+    param(
+        [Parameter(Mandatory)][string]$InstanceId,
+        [Parameter(Mandatory)][string]$Region,
+        [Parameter(Mandatory)]$Request
+    )
+    $arguments = @('ssm', 'start-session', '--target', $InstanceId, '--region', $Region)
+    if ($Request.Type -ne 'portForward') { return $arguments }
+    # PowerShell 5.1 はネイティブコマンドへ渡す引数の " を正しく扱えないため、JSON ではなく shorthand 構文で渡す
+    if ($Request.RemoteHost) {
+        return $arguments + @('--document-name', 'AWS-StartPortForwardingSessionToRemoteHost',
+            '--parameters', "host=$($Request.RemoteHost),portNumber=$($Request.RemotePort),localPortNumber=$($Request.LocalPort)")
+    }
+    return $arguments + @('--document-name', 'AWS-StartPortForwardingSession',
+        '--parameters', "portNumber=$($Request.RemotePort),localPortNumber=$($Request.LocalPort)")
+}
+
+function Test-SsmcLocalPortAvailable {
+    param([Parameter(Mandatory)][int]$Port)
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    try {
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $listener.Stop()
+    }
+}
+
+function Start-SsmcSession {
+    param(
+        [Parameter(Mandatory)]$Instance,
+        [Parameter(Mandatory)][string]$Region,
+        [Parameter(Mandatory)]$Request
+    )
+    $name = Get-SsmcInstanceDisplayName $Instance
+    if ($Request.Type -eq 'portForward') {
+        $destination = "${name}:$($Request.RemotePort)"
+        if ($Request.RemoteHost) { $destination = "$($Request.RemoteHost):$($Request.RemotePort)" }
+        Write-Host ''
+        Write-Host "ポートフォワードを開始します: localhost:$($Request.LocalPort) -> $destination（経由: $name / $($Instance.InstanceId)）" -ForegroundColor Green
+        Write-Host "  接続は別のアプリ（リモートデスクトップ、ブラウザ、DB クライアント等）から localhost:$($Request.LocalPort) に対して行ってください。"
+        Write-Host '  このウィンドウを閉じるか Ctrl+C を押すと、トンネルが切断されます。'
+    } else {
+        Write-Host ''
+        Write-Host ">> $name ($($Instance.InstanceId)) に接続します..." -ForegroundColor Green
+    }
+    $exitCode = Invoke-AwsInteractive -Arguments (Get-SsmcSessionArgument -InstanceId $Instance.InstanceId -Region $Region -Request $Request)
+    if ($exitCode -ne 0) {
+        throw (New-SsmcException -Message "セッションの開始に失敗しました（終了コード: $exitCode）。" -ExitCode 3)
+    }
+}
+#endregion
+
+#region Help
+function Format-SsmcPresetSummary {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Preset
+    )
+    $target = $Preset.TargetName
+    if (-not $target) { $target = $Preset.TargetInstanceId }
+    $summary = "$($Config.Environments[$Preset.EnvKey].DisplayName) / $target / $($Preset.Type)"
+    if ($Preset.Type -eq 'portForward') {
+        $remote = $target
+        if ($Preset.RemoteHost) { $remote = $Preset.RemoteHost }
+        $summary += " $($Preset.LocalPort) -> ${remote}:$($Preset.RemotePort)"
+    }
+    return $summary
+}
+
+function Get-SsmcHelpText {
+    param($Config)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('使い方: ssmc [プリセット名] [-Env <環境>] [-Target <Name|InstanceId>]')
+    $lines.Add('            [-LocalPort <n> -RemotePort <n> [-RemoteHost <host>]]')
+    $lines.Add('            [-NoCache] [-ClearCache] [-Verbose] [-Help]')
+    $lines.Add('')
+    $lines.Add('例:')
+    $lines.Add('  ssmc                          対話モードで環境とサーバーを選んで接続')
+    $lines.Add('  ssmc prod-web01               プリセットで接続')
+    $lines.Add('  ssmc -Env prod -Target web01  環境と接続先を指定して接続')
+    $lines.Add('  ssmc -Env prod -LocalPort 15432 -RemotePort 5432 -RemoteHost mydb.example.internal')
+    $lines.Add('                                踏み台を選んでポートフォワードを開始')
+    $lines.Add('  ssmc -NoCache                 キャッシュを使わず MFA から取り直す')
+    $lines.Add('  ssmc -ClearCache              キャッシュを削除')
+    $lines.Add('')
+    $lines.Add('詳細: Get-Help <ssmc.ps1 のパス> -Detailed')
+    if ($null -ne $Config) {
+        $lines.Add('')
+        $lines.Add('環境:')
+        foreach ($environment in $Config.Environments.Values) {
+            $lines.Add(('  {0,-14} {1}' -f $environment.Key, $environment.DisplayName))
+        }
+        $lines.Add('')
+        $lines.Add('プリセット:')
+        if ($Config.Presets.Count -eq 0) { $lines.Add('  （なし）') }
+        foreach ($name in $Config.Presets.Keys) {
+            $lines.Add(('  {0,-14} {1}' -f $name, (Format-SsmcPresetSummary -Config $Config -Preset $Config.Presets[$name])))
+        }
+    }
+    return ($lines -join [Environment]::NewLine)
+}
+#endregion
