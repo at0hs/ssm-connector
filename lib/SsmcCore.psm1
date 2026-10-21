@@ -410,3 +410,85 @@ function Resolve-SsmcRequest {
     return $request
 }
 #endregion
+
+#region CredCache
+function Get-SsmcCachePath {
+    param(
+        [Parameter(Mandatory)][string]$RoleArn,
+        [Parameter(Mandatory)][string]$CacheDirectory
+    )
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($RoleArn))
+    } finally {
+        $sha256.Dispose()
+    }
+    $hex = -join ($hash | ForEach-Object { $_.ToString('x2') })
+    return (Join-Path $CacheDirectory ($hex.Substring(0, 16) + '.dat'))
+}
+
+function Test-SsmcCredentialUsable {
+    param(
+        [Parameter(Mandatory)]$Credential,
+        [Parameter(Mandatory)][string]$RoleArn,
+        [Parameter(Mandatory)][DateTimeOffset]$Now
+    )
+    if ($Credential.RoleArn -ne $RoleArn) { return $false }
+    return (($Credential.Expiration - $Now).TotalMinutes -ge $script:CacheMarginMinutes)
+}
+
+function Save-SsmcCredential {
+    param(
+        [Parameter(Mandatory)]$Credential,
+        [Parameter(Mandatory)][string]$CacheDirectory
+    )
+    if (-not (Test-Path -LiteralPath $CacheDirectory)) { New-Item -ItemType Directory -Path $CacheDirectory -Force | Out-Null }
+    $json = [ordered]@{
+        AccessKeyId     = $Credential.AccessKeyId
+        SecretAccessKey = $Credential.SecretAccessKey
+        SessionToken    = $Credential.SessionToken
+        Expiration      = $Credential.Expiration.ToUniversalTime().ToString('o')
+        RoleArn         = $Credential.RoleArn
+        UserName        = $Credential.UserName
+    } | ConvertTo-Json -Compress
+    # キーを指定しない ConvertFrom-SecureString は DPAPI（CurrentUser）で暗号化する
+    $encrypted = ConvertTo-SecureString -String $json -AsPlainText -Force | ConvertFrom-SecureString
+    [System.IO.File]::WriteAllText((Get-SsmcCachePath -RoleArn $Credential.RoleArn -CacheDirectory $CacheDirectory), $encrypted)
+}
+
+function Read-SsmcCredential {
+    param(
+        [Parameter(Mandatory)][string]$RoleArn,
+        [Parameter(Mandatory)][string]$CacheDirectory,
+        [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow
+    )
+    $path = Get-SsmcCachePath -RoleArn $RoleArn -CacheDirectory $CacheDirectory
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $credential = $null
+    try {
+        $secure = ConvertTo-SecureString -String ([System.IO.File]::ReadAllText($path).Trim())
+        $data = [System.Net.NetworkCredential]::new('', $secure).Password | ConvertFrom-Json
+        $credential = [pscustomobject]@{
+            AccessKeyId     = $data.AccessKeyId
+            SecretAccessKey = $data.SecretAccessKey
+            SessionToken    = $data.SessionToken
+            Expiration      = (ConvertTo-SsmcDateTimeOffset $data.Expiration)
+            RoleArn         = $data.RoleArn
+            UserName        = $data.UserName
+        }
+    } catch {
+        Write-SsmcVerbose "キャッシュを読み込めませんでした: $($_.Exception.Message)"
+    }
+    if ($null -ne $credential -and (Test-SsmcCredentialUsable -Credential $credential -RoleArn $RoleArn -Now $Now)) {
+        return $credential
+    }
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    return $null
+}
+
+function Clear-SsmcCredentialCache {
+    param([Parameter(Mandatory)][string]$CacheDirectory)
+    if (-not (Test-Path -LiteralPath $CacheDirectory)) { return }
+    Get-ChildItem -LiteralPath $CacheDirectory -Filter '*.dat' | Remove-Item -Force
+}
+#endregion

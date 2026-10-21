@@ -327,3 +327,74 @@ Describe 'Config: Resolve-SsmcRequest' {
         { Resolve-SsmcRequest -Config $config -Environment 'prod' -RemoteHost 'mydb' } | Should -Throw -ExpectedMessage '*-RemoteHost*'
     }
 }
+
+Describe 'CredCache' {
+    BeforeAll {
+        $roleArn = 'arn:aws:iam::111111111111:role/Operator'
+        function New-TestCredential {
+            param([DateTimeOffset]$Expiration, [string]$RoleArn = 'arn:aws:iam::111111111111:role/Operator')
+            [pscustomobject]@{
+                AccessKeyId     = 'ASIAEXAMPLE'
+                SecretAccessKey = 'secret'
+                SessionToken    = 'token'
+                Expiration      = $Expiration
+                RoleArn         = $RoleArn
+                UserName        = 'taro'
+            }
+        }
+    }
+    BeforeEach {
+        $cacheDirectory = Join-Path $TestDrive ([guid]::NewGuid().ToString())
+    }
+    It '同じロール ARN からは同じパス、違う ARN からは違うパスを作る' {
+        $a = Get-SsmcCachePath -RoleArn $roleArn -CacheDirectory $cacheDirectory
+        $b = Get-SsmcCachePath -RoleArn $roleArn -CacheDirectory $cacheDirectory
+        $c = Get-SsmcCachePath -RoleArn 'arn:aws:iam::333333333333:role/Operator' -CacheDirectory $cacheDirectory
+        $a | Should -Be $b
+        $a | Should -Not -Be $c
+        (Split-Path -Leaf $a) | Should -Match '^[0-9a-f]{16}\.dat$'
+    }
+    It '保存した認証情報を読み出せる' {
+        $now = [DateTimeOffset]::UtcNow
+        Save-SsmcCredential -Credential (New-TestCredential -Expiration $now.AddMinutes(60)) -CacheDirectory $cacheDirectory
+        $loaded = Read-SsmcCredential -RoleArn $roleArn -CacheDirectory $cacheDirectory -Now $now
+        $loaded.SessionToken | Should -Be 'token'
+        $loaded.UserName | Should -Be 'taro'
+        [int]($loaded.Expiration - $now).TotalMinutes | Should -Be 60
+    }
+    It 'キャッシュファイルに平文の秘密情報が含まれない' {
+        Save-SsmcCredential -Credential (New-TestCredential -Expiration ([DateTimeOffset]::UtcNow.AddMinutes(60))) -CacheDirectory $cacheDirectory
+        $text = [System.IO.File]::ReadAllText((Get-SsmcCachePath -RoleArn $roleArn -CacheDirectory $cacheDirectory))
+        $text | Should -Not -Match 'secret'
+        $text | Should -Not -Match 'ASIAEXAMPLE'
+    }
+    It '残り 5 分未満なら $null を返し、ファイルを削除する' {
+        $now = [DateTimeOffset]::UtcNow
+        Save-SsmcCredential -Credential (New-TestCredential -Expiration $now.AddMinutes(4)) -CacheDirectory $cacheDirectory
+        Read-SsmcCredential -RoleArn $roleArn -CacheDirectory $cacheDirectory -Now $now | Should -BeNullOrEmpty
+        Test-Path -LiteralPath (Get-SsmcCachePath -RoleArn $roleArn -CacheDirectory $cacheDirectory) | Should -BeFalse
+    }
+    It '壊れたファイルは $null を返し、削除する' {
+        New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
+        $path = Get-SsmcCachePath -RoleArn $roleArn -CacheDirectory $cacheDirectory
+        Set-Content -LiteralPath $path -Value 'broken'
+        Read-SsmcCredential -RoleArn $roleArn -CacheDirectory $cacheDirectory | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $path | Should -BeFalse
+    }
+    It 'ファイルがなければ $null を返す' {
+        Read-SsmcCredential -RoleArn $roleArn -CacheDirectory $cacheDirectory | Should -BeNullOrEmpty
+    }
+    It 'RoleArn が一致しなければ使えないと判定する' {
+        $now = [DateTimeOffset]::UtcNow
+        $credential = New-TestCredential -Expiration $now.AddMinutes(60) -RoleArn 'arn:aws:iam::333333333333:role/Operator'
+        Test-SsmcCredentialUsable -Credential $credential -RoleArn $roleArn -Now $now | Should -BeFalse
+    }
+    It 'Clear-SsmcCredentialCache はキャッシュファイルをすべて削除する' {
+        Save-SsmcCredential -Credential (New-TestCredential -Expiration ([DateTimeOffset]::UtcNow.AddMinutes(60))) -CacheDirectory $cacheDirectory
+        Clear-SsmcCredentialCache -CacheDirectory $cacheDirectory
+        @(Get-ChildItem -LiteralPath $cacheDirectory -Filter '*.dat').Count | Should -Be 0
+    }
+    It 'キャッシュフォルダーがなくても Clear-SsmcCredentialCache は失敗しない' {
+        { Clear-SsmcCredentialCache -CacheDirectory $cacheDirectory } | Should -Not -Throw
+    }
+}
