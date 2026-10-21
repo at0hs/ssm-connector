@@ -121,7 +121,7 @@ function Write-SsmcMenuFrame {
     # 最終桁まで書くと折り返して表示が崩れるため 1 桁残す
     $width = [Math]::Max(20, [Console]::WindowWidth - 1)
     $indexes = @(Get-SsmcMenuFilteredIndex -Items $Items -Filter $State.Filter)
-    Write-SsmcMenuLine -Row $Origin -Width $width -Text "$Title  [上下:移動 Enter:決定 文字:絞り込み Esc:終了]" -Color Cyan
+    Write-SsmcMenuLine -Row $Origin -Width $width -Text "$Title  [↑↓:移動 Enter:決定 文字:絞り込み Esc:終了]" -Color Cyan
     Write-SsmcMenuLine -Row ($Origin + 1) -Width $width -Text " 絞り込み: $($State.Filter)_  ($($indexes.Count)/$($Items.Count) 件)"
     for ($row = 0; $row -lt $PageSize; $row++) {
         $position = $State.Top + $row
