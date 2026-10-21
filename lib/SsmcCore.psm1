@@ -125,3 +125,47 @@ function ConvertTo-SsmcDateTimeOffset {
     return [DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture)
 }
 #endregion
+
+#region Prereq
+function Get-SsmcAwsCliVersion {
+    $result = Invoke-Aws -Arguments @('--version')
+    if ($result.ExitCode -ne 0) { return $null }
+    if ("$($result.StdOut) $($result.StdErr)" -match 'aws-cli/(\d+\.\d+\.\d+)') { return [version]$Matches[1] }
+    return $null
+}
+
+function Find-SsmcSessionManagerPlugin {
+    $command = Get-Command session-manager-plugin -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $command) { return $command.Path }
+    $defaultPath = Join-Path $env:ProgramFiles 'Amazon\SessionManagerPlugin\bin\session-manager-plugin.exe'
+    if (Test-Path -LiteralPath $defaultPath) { return $defaultPath }
+    return $null
+}
+
+function Test-SsmcPrerequisite {
+    param([Parameter(Mandatory)][string]$SharedConfigPath)
+    $installUrl = 'https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html'
+    if (-not (Get-SsmcAwsPath)) {
+        "AWS CLI v2 が見つかりません。インストールしてください: $installUrl"
+    } else {
+        $version = Get-SsmcAwsCliVersion
+        if ($null -eq $version -or $version -lt $script:MinAwsCliVersion) {
+            "AWS CLI $($script:MinAwsCliVersion) 以上が必要です（aws login に対応するため）。更新してください: $installUrl"
+        }
+    }
+    if (-not (Find-SsmcSessionManagerPlugin)) {
+        'Session Manager Plugin が見つかりません。インストールしてください: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html'
+    }
+    if (-not (Test-Path -LiteralPath $SharedConfigPath)) {
+        "共通設定ファイルが見つかりません: $SharedConfigPath"
+    }
+}
+
+function Add-SsmcPluginToPath {
+    # aws CLI は PATH から session-manager-plugin を探すため、既定のインストール先にしかない場合に備えて追加する
+    $plugin = Find-SsmcSessionManagerPlugin
+    if ($null -eq $plugin) { return }
+    $directory = Split-Path -Parent $plugin
+    if (($env:PATH -split ';') -notcontains $directory) { $env:PATH = "$env:PATH;$directory" }
+}
+#endregion

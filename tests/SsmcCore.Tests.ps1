@@ -90,3 +90,60 @@ Describe 'AwsCli: Invoke-Aws（実際の aws.exe を使用）' {
         $result.StdErr | Should -Match 'ssmc存在しないプロファイル'
     }
 }
+
+Describe 'Prereq: Get-SsmcAwsCliVersion' {
+    It 'aws --version の出力からバージョンを取り出す' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = 'aws-cli/2.33.12 Python/3.13.11 Windows/11 exe/AMD64'; StdErr = '' } }
+        Get-SsmcAwsCliVersion | Should -Be ([version]'2.33.12')
+    }
+    It '実行に失敗したら $null' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'error' } }
+        Get-SsmcAwsCliVersion | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Prereq: Test-SsmcPrerequisite' {
+    BeforeAll {
+        $sharedPath = Join-Path $TestDrive 'ssmc.shared.json'
+        Set-Content -LiteralPath $sharedPath -Value '{}'
+    }
+    BeforeEach {
+        Mock -ModuleName SsmcCore Get-SsmcAwsPath { 'C:\Program Files\Amazon\AWSCLIV2\aws.exe' }
+        Mock -ModuleName SsmcCore Get-SsmcAwsCliVersion { [version]'2.33.12' }
+        Mock -ModuleName SsmcCore Find-SsmcSessionManagerPlugin { 'C:\Program Files\Amazon\SessionManagerPlugin\bin\session-manager-plugin.exe' }
+    }
+    It 'すべてそろっていれば問題なし' {
+        @(Test-SsmcPrerequisite -SharedConfigPath $sharedPath).Count | Should -Be 0
+    }
+    It 'AWS CLI がなければ案内を返す' {
+        Mock -ModuleName SsmcCore Get-SsmcAwsPath { $null }
+        (@(Test-SsmcPrerequisite -SharedConfigPath $sharedPath) -join "`n") | Should -Match 'AWS CLI v2 が見つかりません'
+    }
+    It 'AWS CLI が古ければ案内を返す' {
+        Mock -ModuleName SsmcCore Get-SsmcAwsCliVersion { [version]'2.31.0' }
+        (@(Test-SsmcPrerequisite -SharedConfigPath $sharedPath) -join "`n") | Should -Match '2\.32\.0 以上が必要'
+    }
+    It 'Session Manager Plugin がなければ案内を返す' {
+        Mock -ModuleName SsmcCore Find-SsmcSessionManagerPlugin { $null }
+        (@(Test-SsmcPrerequisite -SharedConfigPath $sharedPath) -join "`n") | Should -Match 'Session Manager Plugin が見つかりません'
+    }
+    It '共通設定ファイルがなければ案内を返す' {
+        (@(Test-SsmcPrerequisite -SharedConfigPath (Join-Path $TestDrive 'none.json')) -join "`n") | Should -Match '共通設定ファイルが見つかりません'
+    }
+}
+
+Describe 'Prereq: Add-SsmcPluginToPath' {
+    BeforeEach { $script:originalPath = $env:PATH }
+    AfterEach { $env:PATH = $script:originalPath }
+    It 'Plugin のフォルダーが PATH になければ追加する' {
+        Mock -ModuleName SsmcCore Find-SsmcSessionManagerPlugin { 'C:\ssmc-test-plugin\bin\session-manager-plugin.exe' }
+        Add-SsmcPluginToPath
+        ($env:PATH -split ';') | Should -Contain 'C:\ssmc-test-plugin\bin'
+    }
+    It 'すでに PATH にあれば重複して追加しない' {
+        $env:PATH = "$env:PATH;C:\ssmc-test-plugin\bin"
+        Mock -ModuleName SsmcCore Find-SsmcSessionManagerPlugin { 'C:\ssmc-test-plugin\bin\session-manager-plugin.exe' }
+        Add-SsmcPluginToPath
+        @($env:PATH -split ';' | Where-Object { $_ -eq 'C:\ssmc-test-plugin\bin' }).Count | Should -Be 1
+    }
+}
