@@ -147,3 +147,183 @@ Describe 'Prereq: Add-SsmcPluginToPath' {
         @($env:PATH -split ';' | Where-Object { $_ -eq 'C:\ssmc-test-plugin\bin' }).Count | Should -Be 1
     }
 }
+
+Describe 'Config: Merge-SsmcConfig' {
+    BeforeAll {
+        function New-TestShared {
+            [ordered]@{
+                version      = 1
+                defaults     = [ordered]@{ region = 'ap-northeast-1'; credentialTtlMinutes = 60 }
+                environments = [ordered]@{
+                    dev  = [ordered]@{ displayName = '開発'; roleArn = 'arn:aws:iam::111111111111:role/Operator' }
+                    prod = [ordered]@{ displayName = '本番'; roleArn = 'arn:aws:iam::333333333333:role/Operator'; region = 'us-east-1' }
+                }
+                presets      = [ordered]@{
+                    'shared-web' = [ordered]@{ env = 'dev'; target = [ordered]@{ name = 'web01' } }
+                }
+            }
+        }
+    }
+    It '環境ごとの region を省略すると defaults.region を使う' {
+        $config = Merge-SsmcConfig -Shared (New-TestShared) -User ([ordered]@{})
+        $config.Environments['dev'].Region | Should -Be 'ap-northeast-1'
+        $config.Environments['prod'].Region | Should -Be 'us-east-1'
+    }
+    It '個人設定の credentialTtlMinutes が共通設定を上書きする' {
+        $config = Merge-SsmcConfig -Shared (New-TestShared) -User ([ordered]@{ credentialTtlMinutes = 30 })
+        $config.CredentialTtlMinutes | Should -Be 30
+    }
+    It '個人設定の environments は同じキーを上書きし、新しいキーを追加する' {
+        $user = [ordered]@{ environments = [ordered]@{
+            dev = [ordered]@{ displayName = '開発(個人)'; roleArn = 'arn:aws:iam::111111111111:role/Other' }
+            sbx = [ordered]@{ displayName = '砂場'; roleArn = 'arn:aws:iam::444444444444:role/Operator' }
+        } }
+        $config = Merge-SsmcConfig -Shared (New-TestShared) -User $user
+        $config.Environments['dev'].DisplayName | Should -Be '開発(個人)'
+        $config.Environments.Keys | Should -Contain 'sbx'
+    }
+    It '個人設定の presets は同名の共通プリセットを上書きする' {
+        $user = [ordered]@{ presets = [ordered]@{ 'shared-web' = [ordered]@{ env = 'prod'; target = [ordered]@{ instanceId = 'i-0123456789abcdef0' } } } }
+        $config = Merge-SsmcConfig -Shared (New-TestShared) -User $user
+        $config.Presets['shared-web'].EnvKey | Should -Be 'prod'
+        $config.Presets['shared-web'].TargetInstanceId | Should -Be 'i-0123456789abcdef0'
+        $config.Presets['shared-web'].Type | Should -Be 'shell'
+    }
+    It 'loginProfile を個人設定から読む' {
+        (Merge-SsmcConfig -Shared (New-TestShared) -User ([ordered]@{ loginProfile = 'my-login' })).LoginProfile | Should -Be 'my-login'
+    }
+    It 'version が 1 でなければ終了コード 1 で失敗する' {
+        $shared = New-TestShared; $shared['version'] = 2
+        $err = { Merge-SsmcConfig -Shared $shared -User ([ordered]@{}) } | Should -Throw -ExpectedMessage '*version*' -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 1
+    }
+    It 'credentialTtlMinutes が 15 未満なら失敗する' {
+        { Merge-SsmcConfig -Shared (New-TestShared) -User ([ordered]@{ credentialTtlMinutes = 14 }) } | Should -Throw -ExpectedMessage '*15 以上*'
+    }
+    It 'roleArn の形式が不正なら失敗する' {
+        $shared = New-TestShared; $shared['environments']['dev']['roleArn'] = 'Operator'
+        { Merge-SsmcConfig -Shared $shared -User ([ordered]@{}) } | Should -Throw -ExpectedMessage "*'dev'*roleArn*"
+    }
+    It 'プリセットの env が存在しなければ失敗する' {
+        $user = [ordered]@{ presets = [ordered]@{ p = [ordered]@{ env = 'none'; target = [ordered]@{ name = 'web01' } } } }
+        { Merge-SsmcConfig -Shared (New-TestShared) -User $user } | Should -Throw -ExpectedMessage "*'p'*env*"
+    }
+    It 'プリセットに target.name と target.instanceId の両方があれば失敗する' {
+        $user = [ordered]@{ presets = [ordered]@{ p = [ordered]@{ env = 'dev'; target = [ordered]@{ name = 'web01'; instanceId = 'i-0123456789abcdef0' } } } }
+        { Merge-SsmcConfig -Shared (New-TestShared) -User $user } | Should -Throw -ExpectedMessage '*どちらか一方*'
+    }
+    It 'portForward のプリセットに localPort がなければ失敗する' {
+        $user = [ordered]@{ presets = [ordered]@{ p = [ordered]@{ env = 'dev'; target = [ordered]@{ name = 'web01' }; type = 'portForward'; remotePort = 5432 } } }
+        { Merge-SsmcConfig -Shared (New-TestShared) -User $user } | Should -Throw -ExpectedMessage '*localPort*'
+    }
+    It 'portForward のプリセットを読み込める' {
+        $user = [ordered]@{ presets = [ordered]@{ db = [ordered]@{ env = 'prod'; target = [ordered]@{ name = 'bastion01' }; type = 'portForward'; remoteHost = 'mydb'; remotePort = 5432; localPort = 15432 } } }
+        $preset = (Merge-SsmcConfig -Shared (New-TestShared) -User $user).Presets['db']
+        $preset.Type | Should -Be 'portForward'
+        $preset.RemoteHost | Should -Be 'mydb'
+        $preset.RemotePort | Should -Be 5432
+        $preset.LocalPort | Should -Be 15432
+    }
+}
+
+Describe 'Config: Get-SsmcConfig / Save-SsmcLoginProfile' {
+    BeforeAll {
+        $sharedPath = Join-Path $TestDrive 'ssmc.shared.json'
+        $sharedJson = @'
+{
+  "version": 1,
+  "defaults": { "region": "ap-northeast-1", "credentialTtlMinutes": 60 },
+  "environments": { "dev": { "displayName": "開発", "roleArn": "arn:aws:iam::111111111111:role/Operator" } },
+  "presets": {}
+}
+'@
+        [System.IO.File]::WriteAllText($sharedPath, $sharedJson, [System.Text.UTF8Encoding]::new($false))
+    }
+    It '個人設定ファイルがなくても読み込める' {
+        $config = Get-SsmcConfig -SharedConfigPath $sharedPath -UserConfigPath (Join-Path $TestDrive 'none\ssmc.user.json')
+        $config.Environments['dev'].DisplayName | Should -Be '開発'
+        $config.LoginProfile | Should -BeNullOrEmpty
+    }
+    It 'JSON が壊れていれば終了コード 1 で失敗する' {
+        $broken = Join-Path $TestDrive 'broken.json'
+        Set-Content -LiteralPath $broken -Value '{ "version": '
+        $err = { Get-SsmcConfig -SharedConfigPath $broken -UserConfigPath (Join-Path $TestDrive 'none.json') } | Should -Throw -ExpectedMessage '*broken.json*' -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 1
+    }
+    It 'loginProfile を保存し、既存の設定は残す' {
+        $userPath = Join-Path $TestDrive 'user\ssmc.user.json'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $userPath) -Force | Out-Null
+        Set-Content -LiteralPath $userPath -Value '{ "credentialTtlMinutes": 30 }'
+        Save-SsmcLoginProfile -UserConfigPath $userPath -LoginProfile 'my-login'
+        $config = Get-SsmcConfig -SharedConfigPath $sharedPath -UserConfigPath $userPath
+        $config.LoginProfile | Should -Be 'my-login'
+        $config.CredentialTtlMinutes | Should -Be 30
+    }
+    It '個人設定のフォルダーがなければ作成して保存する' {
+        $userPath = Join-Path $TestDrive 'new\dir\ssmc.user.json'
+        Save-SsmcLoginProfile -UserConfigPath $userPath -LoginProfile 'my-login'
+        Test-Path -LiteralPath $userPath | Should -BeTrue
+    }
+}
+
+Describe 'Config: Resolve-SsmcRequest' {
+    BeforeAll {
+        $shared = [ordered]@{
+            version      = 1
+            defaults     = [ordered]@{ region = 'ap-northeast-1'; credentialTtlMinutes = 60 }
+            environments = [ordered]@{
+                dev  = [ordered]@{ displayName = '開発'; roleArn = 'arn:aws:iam::111111111111:role/Operator' }
+                prod = [ordered]@{ displayName = '本番'; roleArn = 'arn:aws:iam::333333333333:role/Operator' }
+            }
+        }
+        $user = [ordered]@{ presets = [ordered]@{ 'prod-web01' = [ordered]@{ env = 'prod'; target = [ordered]@{ name = 'web01' } } } }
+        $config = Merge-SsmcConfig -Shared $shared -User $user
+    }
+    It '引数なしなら空のリクエストを返す' {
+        $request = Resolve-SsmcRequest -Config $config
+        $request.EnvKey | Should -BeNullOrEmpty
+        $request.Type | Should -Be 'shell'
+    }
+    It 'プリセットを解決する' {
+        $request = Resolve-SsmcRequest -Config $config -Preset 'prod-web01'
+        $request.EnvKey | Should -Be 'prod'
+        $request.TargetName | Should -Be 'web01'
+    }
+    It 'プリセットを解決しても元のプリセットは変更されない' {
+        $null = Resolve-SsmcRequest -Config $config -Preset 'prod-web01' -Target 'web02'
+        $config.Presets['prod-web01'].TargetName | Should -Be 'web01'
+    }
+    It '存在しないプリセットは終了コード 1 で失敗する' {
+        $err = { Resolve-SsmcRequest -Config $config -Preset 'none' } | Should -Throw -ExpectedMessage "*'none'*" -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 1
+    }
+    It '存在しない環境は失敗する' {
+        { Resolve-SsmcRequest -Config $config -Environment 'none' } | Should -Throw -ExpectedMessage "*環境 'none'*"
+    }
+    It 'インスタンス ID 形式の -Target は TargetInstanceId になる' {
+        $request = Resolve-SsmcRequest -Config $config -Environment 'dev' -Target 'i-0123456789abcdef0'
+        $request.TargetInstanceId | Should -Be 'i-0123456789abcdef0'
+        $request.TargetName | Should -BeNullOrEmpty
+    }
+    It 'それ以外の -Target は TargetName になる' {
+        (Resolve-SsmcRequest -Config $config -Environment 'dev' -Target 'web01').TargetName | Should -Be 'web01'
+    }
+    It '-Target はプリセットの接続先を上書きする' {
+        $request = Resolve-SsmcRequest -Config $config -Preset 'prod-web01' -Target 'i-0123456789abcdef0'
+        $request.TargetInstanceId | Should -Be 'i-0123456789abcdef0'
+        $request.TargetName | Should -BeNullOrEmpty
+    }
+    It '-LocalPort と -RemotePort でポートフォワードになる' {
+        $request = Resolve-SsmcRequest -Config $config -Environment 'prod' -LocalPort 15432 -RemotePort 5432 -RemoteHost 'mydb'
+        $request.Type | Should -Be 'portForward'
+        $request.LocalPort | Should -Be 15432
+        $request.RemotePort | Should -Be 5432
+        $request.RemoteHost | Should -Be 'mydb'
+    }
+    It '-LocalPort だけでは失敗する' {
+        { Resolve-SsmcRequest -Config $config -Environment 'prod' -LocalPort 15432 } | Should -Throw -ExpectedMessage '*-LocalPort と -RemotePort*'
+    }
+    It '-RemoteHost だけでは失敗する' {
+        { Resolve-SsmcRequest -Config $config -Environment 'prod' -RemoteHost 'mydb' } | Should -Throw -ExpectedMessage '*-RemoteHost*'
+    }
+}

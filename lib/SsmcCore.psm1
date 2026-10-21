@@ -169,3 +169,244 @@ function Add-SsmcPluginToPath {
     if (($env:PATH -split ';') -notcontains $directory) { $env:PATH = "$env:PATH;$directory" }
 }
 #endregion
+
+#region Config
+function Get-SsmcUserConfigPath {
+    return (Join-Path $env:APPDATA 'ssmc\ssmc.user.json')
+}
+
+function Get-SsmcCacheDirectory {
+    return (Join-Path $env:LOCALAPPDATA 'ssmc\cache')
+}
+
+function Test-SsmcInteger {
+    param($Value)
+    # PowerShell 5.1 は Int32、7 は Int64 で JSON の数値を返すことがある
+    return ($Value -is [int] -or $Value -is [long])
+}
+
+function Test-SsmcPort {
+    param($Value)
+    return ((Test-SsmcInteger $Value) -and $Value -ge 1 -and $Value -le 65535)
+}
+
+function ConvertTo-SsmcHashtable {
+    param($InputObject)
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $table = [ordered]@{}
+        foreach ($property in $InputObject.PSObject.Properties) {
+            $table[$property.Name] = ConvertTo-SsmcHashtable $property.Value
+        }
+        return $table
+    }
+    return $InputObject
+}
+
+function Read-SsmcJsonFile {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $text = [System.IO.File]::ReadAllText($Path)
+        return (ConvertTo-SsmcHashtable ($text | ConvertFrom-Json))
+    } catch {
+        throw (New-SsmcException -Message "設定ファイルを読み込めません: $Path ($($_.Exception.Message))" -ExitCode 1)
+    }
+}
+
+function Join-SsmcTable {
+    param($Base, $Override)
+    $result = [ordered]@{}
+    foreach ($table in @($Base, $Override)) {
+        if ($null -eq $table) { continue }
+        foreach ($key in $table.Keys) { $result[$key] = $table[$key] }
+    }
+    return $result
+}
+
+function New-SsmcRequest {
+    return [pscustomobject]@{
+        EnvKey           = $null
+        TargetName       = $null
+        TargetInstanceId = $null
+        Type             = 'shell'
+        RemoteHost       = $null
+        RemotePort       = $null
+        LocalPort        = $null
+    }
+}
+
+function ConvertTo-SsmcPreset {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Raw,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Environments
+    )
+    $prefix = "プリセット '$Name'"
+    if (-not $Environments.Contains([string]$Raw['env'])) {
+        throw (New-SsmcException -Message "$prefix の env '$($Raw['env'])' は environments に存在しません。" -ExitCode 1)
+    }
+    $targetName = $null
+    $targetInstanceId = $null
+    if ($Raw['target'] -is [System.Collections.IDictionary]) {
+        $targetName = $Raw['target']['name']
+        $targetInstanceId = $Raw['target']['instanceId']
+    }
+    if ([string]::IsNullOrWhiteSpace($targetName) -eq [string]::IsNullOrWhiteSpace($targetInstanceId)) {
+        throw (New-SsmcException -Message "$prefix は target.name と target.instanceId のどちらか一方を指定してください。" -ExitCode 1)
+    }
+    $type = 'shell'
+    if ($Raw['type']) { $type = [string]$Raw['type'] }
+    if ($type -cnotin @('shell', 'portForward')) {
+        throw (New-SsmcException -Message "$prefix の type は shell または portForward を指定してください。" -ExitCode 1)
+    }
+    $request = New-SsmcRequest
+    $request.EnvKey = [string]$Raw['env']
+    $request.TargetName = $targetName
+    $request.TargetInstanceId = $targetInstanceId
+    $request.Type = $type
+    if ($type -eq 'portForward') {
+        foreach ($field in @('remotePort', 'localPort')) {
+            if (-not (Test-SsmcPort $Raw[$field])) {
+                throw (New-SsmcException -Message "$prefix の $field は 1〜65535 の整数で指定してください。" -ExitCode 1)
+            }
+        }
+        $request.RemoteHost = $Raw['remoteHost']
+        $request.RemotePort = [int]$Raw['remotePort']
+        $request.LocalPort = [int]$Raw['localPort']
+    }
+    return $request
+}
+
+function Merge-SsmcConfig {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.IDictionary]$Shared,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.IDictionary]$User
+    )
+    if ($Shared['version'] -ne 1) {
+        throw (New-SsmcException -Message '共通設定の version は 1 を指定してください。' -ExitCode 1)
+    }
+    $defaults = $Shared['defaults']
+    if ($defaults -isnot [System.Collections.IDictionary] -or [string]::IsNullOrWhiteSpace($defaults['region'])) {
+        throw (New-SsmcException -Message '共通設定に defaults.region がありません。' -ExitCode 1)
+    }
+    $ttl = $defaults['credentialTtlMinutes']
+    if ($null -ne $User['credentialTtlMinutes']) { $ttl = $User['credentialTtlMinutes'] }
+    if (-not (Test-SsmcInteger $ttl) -or $ttl -lt 15) {
+        throw (New-SsmcException -Message 'credentialTtlMinutes は 15 以上の整数で指定してください。' -ExitCode 1)
+    }
+
+    $rawEnvironments = Join-SsmcTable $Shared['environments'] $User['environments']
+    if ($rawEnvironments.Count -eq 0) {
+        throw (New-SsmcException -Message '共通設定に environments がありません。' -ExitCode 1)
+    }
+    $environments = [ordered]@{}
+    foreach ($key in $rawEnvironments.Keys) {
+        $item = $rawEnvironments[$key]
+        if ([string]::IsNullOrWhiteSpace($item['displayName'])) {
+            throw (New-SsmcException -Message "環境 '$key' に displayName がありません。" -ExitCode 1)
+        }
+        if ($item['roleArn'] -notmatch '^arn:aws:iam::\d{12}:role/.+') {
+            throw (New-SsmcException -Message "環境 '$key' の roleArn が不正です: $($item['roleArn'])" -ExitCode 1)
+        }
+        $region = $defaults['region']
+        if (-not [string]::IsNullOrWhiteSpace($item['region'])) { $region = $item['region'] }
+        $environments[$key] = [pscustomobject]@{
+            Key         = [string]$key
+            DisplayName = $item['displayName']
+            RoleArn     = $item['roleArn']
+            Region      = $region
+        }
+    }
+
+    $presets = [ordered]@{}
+    $rawPresets = Join-SsmcTable $Shared['presets'] $User['presets']
+    foreach ($name in $rawPresets.Keys) {
+        $presets[$name] = ConvertTo-SsmcPreset -Name $name -Raw $rawPresets[$name] -Environments $environments
+    }
+
+    return [pscustomobject]@{
+        CredentialTtlMinutes = [int]$ttl
+        LoginProfile         = $User['loginProfile']
+        Environments         = $environments
+        Presets              = $presets
+    }
+}
+
+function Get-SsmcConfig {
+    param(
+        [Parameter(Mandatory)][string]$SharedConfigPath,
+        [Parameter(Mandatory)][string]$UserConfigPath
+    )
+    $shared = Read-SsmcJsonFile -Path $SharedConfigPath
+    if ($null -eq $shared) { $shared = [ordered]@{} }
+    $user = [ordered]@{}
+    if (Test-Path -LiteralPath $UserConfigPath) {
+        $loaded = Read-SsmcJsonFile -Path $UserConfigPath
+        if ($null -ne $loaded) { $user = $loaded }
+    }
+    return (Merge-SsmcConfig -Shared $shared -User $user)
+}
+
+function Save-SsmcLoginProfile {
+    param(
+        [Parameter(Mandatory)][string]$UserConfigPath,
+        [Parameter(Mandatory)][string]$LoginProfile
+    )
+    $data = [ordered]@{}
+    if (Test-Path -LiteralPath $UserConfigPath) {
+        $loaded = Read-SsmcJsonFile -Path $UserConfigPath
+        if ($null -ne $loaded) { $data = $loaded }
+    }
+    $data['loginProfile'] = $LoginProfile
+    $directory = Split-Path -Parent $UserConfigPath
+    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    [System.IO.File]::WriteAllText($UserConfigPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+}
+
+function Resolve-SsmcRequest {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string]$Preset,
+        [string]$Environment,
+        [string]$Target,
+        [int]$LocalPort,
+        [int]$RemotePort,
+        [string]$RemoteHost
+    )
+    if ($Preset) {
+        if (-not $Config.Presets.Contains($Preset)) {
+            throw (New-SsmcException -Message "プリセット '$Preset' が見つかりません。ssmc --help で一覧を確認してください。" -ExitCode 1)
+        }
+        $request = $Config.Presets[$Preset].PSObject.Copy()
+    } else {
+        $request = New-SsmcRequest
+    }
+    if ($Environment) {
+        if (-not $Config.Environments.Contains($Environment)) {
+            throw (New-SsmcException -Message "環境 '$Environment' が見つかりません。ssmc --help で一覧を確認してください。" -ExitCode 1)
+        }
+        $request.EnvKey = $Environment
+    }
+    if ($Target) {
+        if ($Target -match '^i-[0-9a-f]{8,17}$') {
+            $request.TargetInstanceId = $Target
+            $request.TargetName = $null
+        } else {
+            $request.TargetName = $Target
+            $request.TargetInstanceId = $null
+        }
+    }
+    if ($LocalPort -or $RemotePort) {
+        if (-not (Test-SsmcPort $LocalPort) -or -not (Test-SsmcPort $RemotePort)) {
+            throw (New-SsmcException -Message '-LocalPort と -RemotePort は両方を 1〜65535 で指定してください。' -ExitCode 1)
+        }
+        $request.Type = 'portForward'
+        $request.LocalPort = $LocalPort
+        $request.RemotePort = $RemotePort
+        $request.RemoteHost = $null
+        if ($RemoteHost) { $request.RemoteHost = $RemoteHost }
+    } elseif ($RemoteHost) {
+        throw (New-SsmcException -Message '-RemoteHost を使うときは -LocalPort と -RemotePort も指定してください。' -ExitCode 1)
+    }
+    return $request
+}
+#endregion
