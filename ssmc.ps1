@@ -51,8 +51,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'lib\SsmcCore.psm1') -Force
-Import-Module (Join-Path $PSScriptRoot 'lib\SsmcMenu.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'lib\SsmcCore.psm1') -Force -Verbose:$false
+Import-Module (Join-Path $PSScriptRoot 'lib\SsmcMenu.psm1') -Force -Verbose:$false
 
 $sharedConfigPath = Join-Path $PSScriptRoot 'ssmc.shared.json'
 $userConfigPath = Get-SsmcUserConfigPath
