@@ -398,3 +398,148 @@ Describe 'CredCache' {
         { Clear-SsmcCredentialCache -CacheDirectory $cacheDirectory } | Should -Not -Throw
     }
 }
+
+Describe 'Auth: Get-SsmcMfaSerial / Get-SsmcCallerIdentity' {
+    It 'MFA シリアルをアカウント ID とユーザー名から組み立てる' {
+        Get-SsmcMfaSerial -Account '111111111111' -UserName 'taro' | Should -Be 'arn:aws:iam::111111111111:mfa/taro'
+    }
+    It 'get-caller-identity の結果からユーザー名を取り出す' {
+        Mock -ModuleName SsmcCore Invoke-Aws {
+            [pscustomobject]@{ ExitCode = 0; StdOut = '{"UserId":"AIDA","Account":"111111111111","Arn":"arn:aws:iam::111111111111:user/taro"}'; StdErr = '' }
+        }
+        $identity = Get-SsmcCallerIdentity -LoginProfile 'my-login'
+        $identity.Account | Should -Be '111111111111'
+        $identity.UserName | Should -Be 'taro'
+        Should -Invoke -ModuleName SsmcCore Invoke-Aws -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'sts get-caller-identity --profile my-login --output json' }
+    }
+    It '失敗したら $null を返す' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 255; StdOut = ''; StdErr = 'The config profile (my-login) could not be found' } }
+        Get-SsmcCallerIdentity -LoginProfile 'my-login' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Auth: Connect-SsmcLoginProfile' {
+    BeforeEach {
+        Mock -ModuleName SsmcCore Write-Host { }
+        Mock -ModuleName SsmcCore Invoke-AwsInteractive { 0 }
+    }
+    It 'ログイン済みなら aws login を実行しない' {
+        Mock -ModuleName SsmcCore Get-SsmcCallerIdentity { [pscustomobject]@{ Account = '111111111111'; Arn = 'arn'; UserName = 'taro' } }
+        (Connect-SsmcLoginProfile -LoginProfile 'my-login').UserName | Should -Be 'taro'
+        Should -Invoke -ModuleName SsmcCore Invoke-AwsInteractive -Times 0
+    }
+    It '未ログインなら aws login を実行して再確認する' {
+        $identities = [System.Collections.Queue]::new()
+        $identities.Enqueue($null)
+        $identities.Enqueue([pscustomobject]@{ Account = '111111111111'; Arn = 'arn'; UserName = 'taro' })
+        Mock -ModuleName SsmcCore Get-SsmcCallerIdentity { $identities.Dequeue() }
+        (Connect-SsmcLoginProfile -LoginProfile 'my-login').UserName | Should -Be 'taro'
+        Should -Invoke -ModuleName SsmcCore Invoke-AwsInteractive -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'login --profile my-login' }
+    }
+    It 'aws login 後も確認できなければ終了コード 2 で失敗する' {
+        Mock -ModuleName SsmcCore Get-SsmcCallerIdentity { $null }
+        $err = { Connect-SsmcLoginProfile -LoginProfile 'my-login' } | Should -Throw -ExpectedMessage '*ログインに失敗*' -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 2
+    }
+}
+
+Describe 'Auth: Get-SsmcRoleCredential' {
+    BeforeAll {
+        $roleArn = 'arn:aws:iam::333333333333:role/Operator'
+        $successJson = '{"Credentials":{"AccessKeyId":"ASIAEXAMPLE","SecretAccessKey":"secret","SessionToken":"token","Expiration":"2026-10-21T04:00:00+00:00"},"AssumedRoleUser":{}}'
+    }
+    BeforeEach {
+        Mock -ModuleName SsmcCore Write-Host { }
+        Mock -ModuleName SsmcCore Read-SsmcCredential { $null }
+        Mock -ModuleName SsmcCore Save-SsmcCredential { }
+        Mock -ModuleName SsmcCore Connect-SsmcLoginProfile { [pscustomobject]@{ Account = '111111111111'; Arn = 'arn:aws:iam::111111111111:user/taro'; UserName = 'taro' } }
+        Mock -ModuleName SsmcCore Read-SsmcMfaCode { '123456' }
+    }
+    It '有効なキャッシュがあれば AssumeRole しない' {
+        Mock -ModuleName SsmcCore Read-SsmcCredential { [pscustomobject]@{ SessionToken = 'cached'; Expiration = [DateTimeOffset]::UtcNow.AddMinutes(30) } }
+        Mock -ModuleName SsmcCore Invoke-Aws { throw 'should not be called' }
+        (Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive).SessionToken | Should -Be 'cached'
+        Should -Invoke -ModuleName SsmcCore Connect-SsmcLoginProfile -Times 0
+    }
+    It '-NoCache ならキャッシュを読まない' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $successJson; StdErr = '' } }
+        $null = Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive -NoCache
+        Should -Invoke -ModuleName SsmcCore Read-SsmcCredential -Times 0
+    }
+    It 'セッションタグ・MFA・有効時間を指定して AssumeRole し、結果を保存する' {
+        Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $successJson; StdErr = '' } }
+        $credential = Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 30 -CacheDirectory $TestDrive
+        $credential.AccessKeyId | Should -Be 'ASIAEXAMPLE'
+        $credential.RoleArn | Should -Be $roleArn
+        $credential.UserName | Should -Be 'taro'
+        $credential.Expiration | Should -BeOfType [DateTimeOffset]
+        Should -Invoke -ModuleName SsmcCore Invoke-Aws -Times 1 -ParameterFilter {
+            $line = $Arguments -join ' '
+            $line -like 'sts assume-role --profile my-login --role-arn arn:aws:iam::333333333333:role/Operator*' -and
+            $line -like '*--role-session-name taro *' -and
+            $line -like '*--serial-number arn:aws:iam::111111111111:mfa/taro --token-code 123456*' -and
+            $line -like '*--duration-seconds 1800*' -and
+            $line -like '*--tags Key=SSMSessionRunAs,Value=taro*'
+        }
+        Should -Invoke -ModuleName SsmcCore Save-SsmcCredential -Times 1
+    }
+    It 'MFA コードを誤ったら再入力させる' {
+        $codes = [System.Collections.Queue]::new(@('111111', '222222', '333333'))
+        Mock -ModuleName SsmcCore Read-SsmcMfaCode { $codes.Dequeue() }
+        Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'MultiFactorAuthentication failed with invalid MFA one time pass code.' } }
+        Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 0; StdOut = $successJson; StdErr = '' } } -ParameterFilter { $MfaCode -eq '333333' }
+        (Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive).AccessKeyId | Should -Be 'ASIAEXAMPLE'
+        Should -Invoke -ModuleName SsmcCore Read-SsmcMfaCode -Times 3 -Exactly
+    }
+    It 'MFA コードを 3 回誤ったら終了コード 2 で失敗する' {
+        Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'MultiFactorAuthentication failed with invalid MFA one time pass code.' } }
+        $err = { Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*3 回*' -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 2
+        Should -Invoke -ModuleName SsmcCore Read-SsmcMfaCode -Times 3 -Exactly
+    }
+    It '権限不足はすぐに終了コード 2 で失敗する' {
+        Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'An error occurred (AccessDenied) when calling the AssumeRole operation: User is not authorized to perform: sts:TagSession' } }
+        $err = { Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*sts:TagSession*' -PassThru
+        $err.Exception.Data['SsmcExitCode'] | Should -Be 2
+        Should -Invoke -ModuleName SsmcCore Read-SsmcMfaCode -Times 1 -Exactly
+    }
+    It '有効時間がロールの上限を超えたら設定の見直しを案内する' {
+        Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'An error occurred (ValidationError) when calling the AssumeRole operation: The requested DurationSeconds exceeds the MaxSessionDuration set for this role.' } }
+        { Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 120 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*credentialTtlMinutes*'
+    }
+}
+
+Describe 'Auth: Invoke-SsmcWithCredential' {
+    BeforeAll {
+        $names = @('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_REGION', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE')
+        $credential = [pscustomobject]@{ AccessKeyId = 'ASIAEXAMPLE'; SecretAccessKey = 'secret'; SessionToken = 'token' }
+    }
+    BeforeEach {
+        $script:savedEnvironment = @{}
+        foreach ($name in $names) { $script:savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+        $env:AWS_PROFILE = 'original-profile'
+    }
+    AfterEach {
+        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $script:savedEnvironment[$name], 'Process') }
+    }
+    It '実行中は認証情報を環境変数に設定し、AWS_PROFILE を外す' {
+        $inside = Invoke-SsmcWithCredential -Credential $credential -Region 'ap-northeast-1' -ScriptBlock {
+            [pscustomobject]@{ Key = $env:AWS_ACCESS_KEY_ID; Token = $env:AWS_SESSION_TOKEN; Region = $env:AWS_REGION; Profile = $env:AWS_PROFILE }
+        }
+        $inside.Key | Should -Be 'ASIAEXAMPLE'
+        $inside.Token | Should -Be 'token'
+        $inside.Region | Should -Be 'ap-northeast-1'
+        $inside.Profile | Should -BeNullOrEmpty
+    }
+    It '終了後は元の値に戻す' {
+        Invoke-SsmcWithCredential -Credential $credential -Region 'ap-northeast-1' -ScriptBlock { }
+        $env:AWS_ACCESS_KEY_ID | Should -BeNullOrEmpty
+        $env:AWS_PROFILE | Should -Be 'original-profile'
+    }
+    It '例外が起きても元の値に戻す' {
+        { Invoke-SsmcWithCredential -Credential $credential -Region 'ap-northeast-1' -ScriptBlock { throw 'boom' } } | Should -Throw
+        $env:AWS_SECRET_ACCESS_KEY | Should -BeNullOrEmpty
+        $env:AWS_PROFILE | Should -Be 'original-profile'
+    }
+}

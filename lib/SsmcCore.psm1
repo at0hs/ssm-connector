@@ -492,3 +492,152 @@ function Clear-SsmcCredentialCache {
     Get-ChildItem -LiteralPath $CacheDirectory -Filter '*.dat' | Remove-Item -Force
 }
 #endregion
+
+#region Auth
+function Get-SsmcCallerIdentity {
+    param([Parameter(Mandatory)][string]$LoginProfile)
+    $result = Invoke-Aws -Arguments @('sts', 'get-caller-identity', '--profile', $LoginProfile, '--output', 'json')
+    if ($result.ExitCode -ne 0) {
+        Write-SsmcVerbose $result.StdErr
+        return $null
+    }
+    $data = ConvertFrom-SsmcAwsJson $result.StdOut
+    return [pscustomobject]@{
+        Account  = $data.Account
+        Arn      = $data.Arn
+        UserName = ($data.Arn -split '/')[-1]
+    }
+}
+
+function Get-SsmcMfaSerial {
+    param(
+        [Parameter(Mandatory)][string]$Account,
+        [Parameter(Mandatory)][string]$UserName
+    )
+    # MFA デバイス名は IAM ユーザー名と同一という運用ルールに基づく
+    return "arn:aws:iam::${Account}:mfa/$UserName"
+}
+
+function Connect-SsmcLoginProfile {
+    param([Parameter(Mandatory)][string]$LoginProfile)
+    $identity = Get-SsmcCallerIdentity -LoginProfile $LoginProfile
+    if ($null -ne $identity) { return $identity }
+    Write-Host "プロファイル '$LoginProfile' のログインを確認できません。ブラウザでログインします..." -ForegroundColor Yellow
+    $null = Invoke-AwsInteractive -Arguments @('login', '--profile', $LoginProfile)
+    $identity = Get-SsmcCallerIdentity -LoginProfile $LoginProfile
+    if ($null -eq $identity) {
+        throw (New-SsmcException -Message "ログインに失敗しました（プロファイル: $LoginProfile）。" -ExitCode 2)
+    }
+    return $identity
+}
+
+function Read-SsmcMfaCode {
+    while ($true) {
+        $secure = Read-Host -Prompt 'MFAコード（6桁）' -AsSecureString
+        $code = [System.Net.NetworkCredential]::new('', $secure).Password
+        if ($code -match '^\d{6}$') { return $code }
+        Write-Host '6桁の数字で入力してください。' -ForegroundColor Yellow
+    }
+}
+
+function Invoke-SsmcAssumeRole {
+    param(
+        [Parameter(Mandatory)][string]$LoginProfile,
+        [Parameter(Mandatory)][string]$RoleArn,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][int]$TtlMinutes,
+        [Parameter(Mandatory)][string]$MfaCode
+    )
+    $serial = Get-SsmcMfaSerial -Account $Identity.Account -UserName $Identity.UserName
+    return (Invoke-Aws -Arguments @(
+            'sts', 'assume-role',
+            '--profile', $LoginProfile,
+            '--role-arn', $RoleArn,
+            '--role-session-name', $Identity.UserName,
+            '--serial-number', $serial,
+            '--token-code', $MfaCode,
+            '--duration-seconds', [string]($TtlMinutes * 60),
+            '--tags', "Key=SSMSessionRunAs,Value=$($Identity.UserName)",
+            '--output', 'json'))
+}
+
+function ConvertFrom-SsmcAssumeRoleOutput {
+    param(
+        [Parameter(Mandatory)][string]$Json,
+        [Parameter(Mandatory)][string]$RoleArn,
+        [Parameter(Mandatory)][string]$UserName
+    )
+    $credentials = (ConvertFrom-SsmcAwsJson $Json).Credentials
+    return [pscustomobject]@{
+        AccessKeyId     = $credentials.AccessKeyId
+        SecretAccessKey = $credentials.SecretAccessKey
+        SessionToken    = $credentials.SessionToken
+        Expiration      = (ConvertTo-SsmcDateTimeOffset $credentials.Expiration)
+        RoleArn         = $RoleArn
+        UserName        = $UserName
+    }
+}
+
+function Get-SsmcRoleCredential {
+    param(
+        [Parameter(Mandatory)][string]$LoginProfile,
+        [Parameter(Mandatory)][string]$RoleArn,
+        [Parameter(Mandatory)][int]$TtlMinutes,
+        [Parameter(Mandatory)][string]$CacheDirectory,
+        [switch]$NoCache
+    )
+    if (-not $NoCache) {
+        $cached = Read-SsmcCredential -RoleArn $RoleArn -CacheDirectory $CacheDirectory
+        if ($null -ne $cached) {
+            Write-Host "キャッシュ済みの認証情報を使用します（有効期限: $($cached.Expiration.ToLocalTime().ToString('HH:mm'))）" -ForegroundColor DarkGray
+            return $cached
+        }
+    }
+    $identity = Connect-SsmcLoginProfile -LoginProfile $LoginProfile
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $code = Read-SsmcMfaCode
+        $result = Invoke-SsmcAssumeRole -LoginProfile $LoginProfile -RoleArn $RoleArn -Identity $identity -TtlMinutes $TtlMinutes -MfaCode $code
+        if ($result.ExitCode -eq 0) {
+            $credential = ConvertFrom-SsmcAssumeRoleOutput -Json $result.StdOut -RoleArn $RoleArn -UserName $identity.UserName
+            Save-SsmcCredential -Credential $credential -CacheDirectory $CacheDirectory
+            return $credential
+        }
+        $kind = Get-SsmcAwsErrorKind $result.StdErr
+        if ($kind -eq 'InvalidMfa' -and $attempt -lt $maxAttempts) {
+            Write-Host 'MFAコードが正しくないか、期限切れです。もう一度入力してください。' -ForegroundColor Yellow
+            continue
+        }
+        if ($kind -eq 'InvalidMfa') {
+            throw (New-SsmcException -Message "MFAコードの認証に $maxAttempts 回失敗しました。" -ExitCode 2)
+        }
+        if ($result.StdErr -match 'DurationSeconds') {
+            throw (New-SsmcException -Message "credentialTtlMinutes（$TtlMinutes 分）がロールの最大セッション時間を超えています。設定を見直してください。" -ExitCode 2)
+        }
+        throw (New-SsmcException -Message "ロールへのスイッチに失敗しました: $($result.StdErr.Trim())" -ExitCode 2)
+    }
+}
+
+function Invoke-SsmcWithCredential {
+    param(
+        [Parameter(Mandatory)]$Credential,
+        [Parameter(Mandatory)][string]$Region,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock
+    )
+    $names = @('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_REGION', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE')
+    $saved = @{}
+    foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+    try {
+        [Environment]::SetEnvironmentVariable('AWS_ACCESS_KEY_ID', $Credential.AccessKeyId, 'Process')
+        [Environment]::SetEnvironmentVariable('AWS_SECRET_ACCESS_KEY', $Credential.SecretAccessKey, 'Process')
+        [Environment]::SetEnvironmentVariable('AWS_SESSION_TOKEN', $Credential.SessionToken, 'Process')
+        [Environment]::SetEnvironmentVariable('AWS_REGION', $Region, 'Process')
+        # プロファイル指定が残っていると、そちらの認証情報が使われるおそれがあるため外す
+        [Environment]::SetEnvironmentVariable('AWS_PROFILE', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('AWS_DEFAULT_PROFILE', $null, 'Process')
+        & $ScriptBlock
+    } finally {
+        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+    }
+}
+#endregion
