@@ -783,6 +783,8 @@ function Start-SsmcSession {
         Write-Host "ポートフォワードを開始します: localhost:$($Request.LocalPort) -> $destination（経由: $name / $($Instance.InstanceId)）" -ForegroundColor Green
         Write-Host "  接続は別のアプリ（リモートデスクトップ、ブラウザ、DB クライアント等）から localhost:$($Request.LocalPort) に対して行ってください。"
         Write-Host '  このウィンドウを閉じるか Ctrl+C を押すと、トンネルが切断されます。'
+        # Ctrl+C は cmd にも届くため、ssmc.bat 経由では cmd の確認が表示される（.bat 側では抑止できない）
+        Write-Host '  ssmc.bat から起動した場合、Ctrl+C の後に「バッチ ジョブを終了しますか (Y/N)?」(Terminate batch job) と表示されたら Y を押してください。'
     } else {
         Write-Host ''
         Write-Host ">> $name ($($Instance.InstanceId)) に接続します..." -ForegroundColor Green
