@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "defaults": {
+    "region": "ap-northeast-1",
+    "credentialTtlMinutes": 60
+  },
+  "environments": {
+    "dev":  { "displayName": "開発", "roleArn": "arn:aws:iam::111111111111:role/Operator" },
+    "stg":  { "displayName": "検証", "roleArn": "arn:aws:iam::222222222222:role/Operator" },
+    "prod": { "displayName": "本番", "roleArn": "arn:aws:iam::333333333333:role/Operator" }
+  },
+  "presets": {}
+}
