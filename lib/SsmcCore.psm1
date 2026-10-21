@@ -618,6 +618,17 @@ function Get-SsmcRoleCredential {
     }
 }
 
+function Set-SsmcProcessEnvironment {
+    param([Parameter(Mandatory)][string]$Name, [AllowNull()][string]$Value)
+    # [Environment]::SetEnvironmentVariable に $null を渡すと PowerShell が空文字に変換し、
+    # PowerShell 7 (.NET) では空文字の変数が残る。aws CLI は AWS_PROFILE= を「プロファイル ''」と解釈して失敗する
+    if ([string]::IsNullOrEmpty($Value)) {
+        Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+    } else {
+        Set-Item -LiteralPath "Env:$Name" -Value $Value
+    }
+}
+
 function Invoke-SsmcWithCredential {
     param(
         [Parameter(Mandatory)]$Credential,
@@ -628,16 +639,16 @@ function Invoke-SsmcWithCredential {
     $saved = @{}
     foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
     try {
-        [Environment]::SetEnvironmentVariable('AWS_ACCESS_KEY_ID', $Credential.AccessKeyId, 'Process')
-        [Environment]::SetEnvironmentVariable('AWS_SECRET_ACCESS_KEY', $Credential.SecretAccessKey, 'Process')
-        [Environment]::SetEnvironmentVariable('AWS_SESSION_TOKEN', $Credential.SessionToken, 'Process')
-        [Environment]::SetEnvironmentVariable('AWS_REGION', $Region, 'Process')
+        Set-SsmcProcessEnvironment -Name 'AWS_ACCESS_KEY_ID' -Value $Credential.AccessKeyId
+        Set-SsmcProcessEnvironment -Name 'AWS_SECRET_ACCESS_KEY' -Value $Credential.SecretAccessKey
+        Set-SsmcProcessEnvironment -Name 'AWS_SESSION_TOKEN' -Value $Credential.SessionToken
+        Set-SsmcProcessEnvironment -Name 'AWS_REGION' -Value $Region
         # プロファイル指定が残っていると、そちらの認証情報が使われるおそれがあるため外す
-        [Environment]::SetEnvironmentVariable('AWS_PROFILE', $null, 'Process')
-        [Environment]::SetEnvironmentVariable('AWS_DEFAULT_PROFILE', $null, 'Process')
+        Set-SsmcProcessEnvironment -Name 'AWS_PROFILE' -Value $null
+        Set-SsmcProcessEnvironment -Name 'AWS_DEFAULT_PROFILE' -Value $null
         & $ScriptBlock
     } finally {
-        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+        foreach ($name in $names) { Set-SsmcProcessEnvironment -Name $name -Value $saved[$name] }
     }
 }
 #endregion

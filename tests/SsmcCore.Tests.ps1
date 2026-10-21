@@ -517,29 +517,40 @@ Describe 'Auth: Invoke-SsmcWithCredential' {
     BeforeEach {
         $script:savedEnvironment = @{}
         foreach ($name in $names) { $script:savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
-        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+        # [Environment]::SetEnvironmentVariable に $null を渡すと PowerShell 7 では空文字の変数が残るため、Remove-Item で消す
+        foreach ($name in $names) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
         $env:AWS_PROFILE = 'original-profile'
     }
     AfterEach {
-        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $script:savedEnvironment[$name], 'Process') }
+        foreach ($name in $names) {
+            if ($null -eq $script:savedEnvironment[$name]) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+            else { Set-Item -LiteralPath "Env:$name" -Value $script:savedEnvironment[$name] }
+        }
     }
     It '実行中は認証情報を環境変数に設定し、AWS_PROFILE を外す' {
         $inside = Invoke-SsmcWithCredential -Credential $credential -Region 'ap-northeast-1' -ScriptBlock {
-            [pscustomobject]@{ Key = $env:AWS_ACCESS_KEY_ID; Token = $env:AWS_SESSION_TOKEN; Region = $env:AWS_REGION; Profile = $env:AWS_PROFILE }
+            [pscustomobject]@{
+                Key = $env:AWS_ACCESS_KEY_ID; Token = $env:AWS_SESSION_TOKEN; Region = $env:AWS_REGION
+                HasProfile = (Test-Path Env:AWS_PROFILE); HasDefaultProfile = (Test-Path Env:AWS_DEFAULT_PROFILE)
+            }
         }
         $inside.Key | Should -Be 'ASIAEXAMPLE'
         $inside.Token | Should -Be 'token'
         $inside.Region | Should -Be 'ap-northeast-1'
-        $inside.Profile | Should -BeNullOrEmpty
+        # 空文字で残っていても aws CLI は「プロファイル '' が見つからない」で失敗するため、変数自体がないこと
+        $inside.HasProfile | Should -BeFalse
+        $inside.HasDefaultProfile | Should -BeFalse
     }
-    It '終了後は元の値に戻す' {
+    It '終了後は元の値に戻し、元々なかった変数は残さない' {
         Invoke-SsmcWithCredential -Credential $credential -Region 'ap-northeast-1' -ScriptBlock { }
-        $env:AWS_ACCESS_KEY_ID | Should -BeNullOrEmpty
+        Test-Path Env:AWS_ACCESS_KEY_ID | Should -BeFalse
+        Test-Path Env:AWS_REGION | Should -BeFalse
+        Test-Path Env:AWS_DEFAULT_PROFILE | Should -BeFalse
         $env:AWS_PROFILE | Should -Be 'original-profile'
     }
     It '例外が起きても元の値に戻す' {
         { Invoke-SsmcWithCredential -Credential $credential -Region 'ap-northeast-1' -ScriptBlock { throw 'boom' } } | Should -Throw
-        $env:AWS_SECRET_ACCESS_KEY | Should -BeNullOrEmpty
+        Test-Path Env:AWS_SECRET_ACCESS_KEY | Should -BeFalse
         $env:AWS_PROFILE | Should -Be 'original-profile'
     }
 }
