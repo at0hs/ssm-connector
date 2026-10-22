@@ -95,13 +95,6 @@ try {
         throw (New-SsmcException -Message "ローカルポート $($request.LocalPort) は使用中です。別のポートを指定してください。" -ExitCode 3)
     }
 
-    if ([string]::IsNullOrWhiteSpace($config.LoginProfile)) {
-        $loginProfile = ([string](Read-Host 'aws login で使用するプロファイル名を入力してください')).Trim()
-        if (-not $loginProfile) { throw (New-SsmcException -Message 'プロファイル名が入力されませんでした。' -ExitCode 1) }
-        Save-SsmcLoginProfile -UserConfigPath $userConfigPath -LoginProfile $loginProfile
-        $config.LoginProfile = $loginProfile
-    }
-
     if (-not $request.EnvKey) {
         $environmentItems = @(foreach ($definition in $config.Environments.Values) {
                 [pscustomobject]@{
@@ -117,7 +110,7 @@ try {
     $selectedEnvironment = $config.Environments[$request.EnvKey]
     Write-Host ">> 環境: $($selectedEnvironment.DisplayName)" -ForegroundColor Green
 
-    $credential = Get-SsmcRoleCredential -LoginProfile $config.LoginProfile -RoleArn $selectedEnvironment.RoleArn `
+    $credential = Get-SsmcRoleCredential -Region $selectedEnvironment.Region -RoleArn $selectedEnvironment.RoleArn `
         -TtlMinutes $config.CredentialTtlMinutes -CacheDirectory $cacheDirectory -NoCache:$NoCache
 
     Invoke-SsmcWithCredential -Credential $credential -Region $selectedEnvironment.Region -ScriptBlock {

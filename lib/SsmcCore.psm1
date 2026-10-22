@@ -4,6 +4,8 @@
 $script:VerboseEnabled = $false
 $script:MinAwsCliVersion = [version]'2.32.0'
 $script:CacheMarginMinutes = 5
+# aws login で使う ssmc 専用のプロファイル
+$script:LoginProfile = 'ssmc'
 
 function New-SsmcException {
     param(
@@ -330,7 +332,6 @@ function Merge-SsmcConfig {
 
     return [pscustomobject]@{
         CredentialTtlMinutes = [int]$ttl
-        LoginProfile         = $User['loginProfile']
         Environments         = $environments
         Presets              = $presets
     }
@@ -349,22 +350,6 @@ function Get-SsmcConfig {
         if ($null -ne $loaded) { $user = $loaded }
     }
     return (Merge-SsmcConfig -Shared $shared -User $user)
-}
-
-function Save-SsmcLoginProfile {
-    param(
-        [Parameter(Mandatory)][string]$UserConfigPath,
-        [Parameter(Mandatory)][string]$LoginProfile
-    )
-    $data = [ordered]@{}
-    if (Test-Path -LiteralPath $UserConfigPath) {
-        $loaded = Read-SsmcJsonFile -Path $UserConfigPath
-        if ($null -ne $loaded) { $data = $loaded }
-    }
-    $data['loginProfile'] = $LoginProfile
-    $directory = Split-Path -Parent $UserConfigPath
-    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
-    [System.IO.File]::WriteAllText($UserConfigPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
 }
 
 function Resolve-SsmcRequest {
@@ -500,8 +485,11 @@ function Clear-SsmcCredentialCache {
 
 #region Auth
 function Get-SsmcCallerIdentity {
-    param([Parameter(Mandatory)][string]$LoginProfile)
-    $result = Invoke-Aws -Arguments @('sts', 'get-caller-identity', '--profile', $LoginProfile, '--output', 'json')
+    param(
+        [Parameter(Mandatory)][string]$LoginProfile,
+        [Parameter(Mandatory)][string]$Region
+    )
+    $result = Invoke-Aws -Arguments @('sts', 'get-caller-identity', '--profile', $LoginProfile, '--region', $Region, '--output', 'json')
     if ($result.ExitCode -ne 0) {
         Write-SsmcVerbose $result.StdErr
         return $null
@@ -524,12 +512,15 @@ function Get-SsmcMfaSerial {
 }
 
 function Connect-SsmcLoginProfile {
-    param([Parameter(Mandatory)][string]$LoginProfile)
-    $identity = Get-SsmcCallerIdentity -LoginProfile $LoginProfile
+    param(
+        [Parameter(Mandatory)][string]$LoginProfile,
+        [Parameter(Mandatory)][string]$Region
+    )
+    $identity = Get-SsmcCallerIdentity -LoginProfile $LoginProfile -Region $Region
     if ($null -ne $identity) { return $identity }
     Write-Host "プロファイル '$LoginProfile' のログインを確認できません。ブラウザでログインします..." -ForegroundColor Yellow
-    $null = Invoke-AwsInteractive -Arguments @('login', '--profile', $LoginProfile)
-    $identity = Get-SsmcCallerIdentity -LoginProfile $LoginProfile
+    $null = Invoke-AwsInteractive -Arguments @('login', '--profile', $LoginProfile, '--region', $Region)
+    $identity = Get-SsmcCallerIdentity -LoginProfile $LoginProfile -Region $Region
     if ($null -eq $identity) {
         throw (New-SsmcException -Message "ログインに失敗しました（プロファイル: $LoginProfile）。" -ExitCode 2)
     }
@@ -548,6 +539,7 @@ function Read-SsmcMfaCode {
 function Invoke-SsmcAssumeRole {
     param(
         [Parameter(Mandatory)][string]$LoginProfile,
+        [Parameter(Mandatory)][string]$Region,
         [Parameter(Mandatory)][string]$RoleArn,
         [Parameter(Mandatory)]$Identity,
         [Parameter(Mandatory)][int]$TtlMinutes,
@@ -557,6 +549,7 @@ function Invoke-SsmcAssumeRole {
     return (Invoke-Aws -Arguments @(
             'sts', 'assume-role',
             '--profile', $LoginProfile,
+            '--region', $Region,
             '--role-arn', $RoleArn,
             '--role-session-name', $Identity.UserName,
             '--serial-number', $serial,
@@ -585,7 +578,7 @@ function ConvertFrom-SsmcAssumeRoleOutput {
 
 function Get-SsmcRoleCredential {
     param(
-        [Parameter(Mandatory)][string]$LoginProfile,
+        [Parameter(Mandatory)][string]$Region,
         [Parameter(Mandatory)][string]$RoleArn,
         [Parameter(Mandatory)][int]$TtlMinutes,
         [Parameter(Mandatory)][string]$CacheDirectory,
@@ -598,11 +591,11 @@ function Get-SsmcRoleCredential {
             return $cached
         }
     }
-    $identity = Connect-SsmcLoginProfile -LoginProfile $LoginProfile
+    $identity = Connect-SsmcLoginProfile -LoginProfile $script:LoginProfile -Region $Region
     $maxAttempts = 3
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         $code = Read-SsmcMfaCode
-        $result = Invoke-SsmcAssumeRole -LoginProfile $LoginProfile -RoleArn $RoleArn -Identity $identity -TtlMinutes $TtlMinutes -MfaCode $code
+        $result = Invoke-SsmcAssumeRole -LoginProfile $script:LoginProfile -Region $Region -RoleArn $RoleArn -Identity $identity -TtlMinutes $TtlMinutes -MfaCode $code
         if ($result.ExitCode -eq 0) {
             $credential = ConvertFrom-SsmcAssumeRoleOutput -Json $result.StdOut -RoleArn $RoleArn -UserName $identity.UserName
             Save-SsmcCredential -Credential $credential -CacheDirectory $CacheDirectory

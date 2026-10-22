@@ -92,7 +92,7 @@ ssm-connector/
 |---|---|
 | AwsCli | `Invoke-Aws`：`aws` を実行し、終了コード・stdout・stderr を回収して JSON を解析する。エラーを分類する |
 | Prereq | 必須ツールと共通設定の存在確認 |
-| Config | 設定の読み込み・マージ・検証、プリセットの解決、`loginProfile` の初回保存 |
+| Config | 設定の読み込み・マージ・検証、プリセットの解決 |
 | CredCache | 暗号化した保存・読み出し、有効期限の判定、削除 |
 | Auth | ログイン確認、MFA 入力、AssumeRole。キャッシュがあれば利用する |
 | Inventory | `describe-instances` と `describe-instance-information` を呼び、結果を結合して並べ替える |
@@ -186,14 +186,14 @@ ssmc [[-Preset] <名前>] [-Env <環境キー>] [-Target <Name または Instanc
 
 ### 5.2 認証
 
-1. `aws sts get-caller-identity --profile <loginProfile>` を実行する。
-   - 失敗した場合（プロファイルがない／ログインが切れている）は「ブラウザでログインします」と表示して `aws login --profile <loginProfile>` を実行し、もう一度確認する。2 回目も失敗したら終了コード 2 で終了する。
+1. `aws sts get-caller-identity --profile ssmc --region <region>` を実行する。プロファイル名は ssmc 専用の `ssmc` に固定し、利用者には入力させない。`<region>` は選んだ環境のリージョン。
+   - 失敗した場合（プロファイルがない／ログインが切れている）は「ブラウザでログインします」と表示して `aws login --profile ssmc --region <region>` を実行し、もう一度確認する。2 回目も失敗したら終了コード 2 で終了する。プロファイルがなければ `aws login` が作成する。
 2. 結果の `Arn` から末尾をユーザー名として取り出し、`Account` と組み合わせて MFA シリアル `arn:aws:iam::<Account>:mfa/<UserName>` を組み立てる。
 3. MFA コードを入力してもらう。6 桁の数字でなければその場で再入力させる。30 秒で無効になる値のため、入力は画面に表示する。
 4. 次のコマンドで AssumeRole する。
 
    ```
-   aws sts assume-role --profile <loginProfile>
+   aws sts assume-role --profile ssmc --region <region>
      --role-arn <roleArn>
      --role-session-name <UserName>
      --serial-number arn:aws:iam::<Account>:mfa/<UserName>
@@ -313,7 +313,6 @@ ssmc [[-Preset] <名前>] [-Env <環境キー>] [-Target <Name または Instanc
 
 ```json
 {
-  "loginProfile": "my-login",
   "credentialTtlMinutes": 30,
   "presets": {
     "prod-web01": { "env": "prod", "target": { "name": "web01" } },
@@ -331,7 +330,6 @@ ssmc [[-Preset] <名前>] [-Env <環境キー>] [-Target <Name または Instanc
 
 | 項目 | 必須 | 説明 |
 |---|---|---|
-| `loginProfile` | ○ | `aws login --profile` に渡すプロファイル名。未設定なら初回起動時に入力してもらい保存する |
 | `credentialTtlMinutes` | − | 共通設定の値を上書きする |
 | `presets` | − | 個人のプリセット |
 
@@ -400,7 +398,7 @@ ssmc [[-Preset] <名前>] [-Env <環境キー>] [-Target <Name または Instanc
 
 ### 8.2 手動確認チェックリスト（実 AWS 環境）
 
-- [ ] 初回起動で `loginProfile` を入力し、個人設定に保存される
+- [ ] `ssmc` プロファイルがない状態で起動すると `aws login` が実行され、プロファイルが作られてそのまま続行できる
 - [ ] ログインが切れた状態で起動すると `aws login` が実行され、そのまま続行できる
 - [ ] MFA を誤入力すると再入力でき、3 回誤ると終了する
 - [ ] 2 回目の接続でキャッシュが使われ、MFA の入力を求められない

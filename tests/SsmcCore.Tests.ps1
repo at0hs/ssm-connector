@@ -189,9 +189,6 @@ Describe 'Config: Merge-SsmcConfig' {
         $config.Presets['shared-web'].TargetInstanceId | Should -Be 'i-0123456789abcdef0'
         $config.Presets['shared-web'].Type | Should -Be 'shell'
     }
-    It 'loginProfile を個人設定から読む' {
-        (Merge-SsmcConfig -Shared (New-TestShared) -User ([ordered]@{ loginProfile = 'my-login' })).LoginProfile | Should -Be 'my-login'
-    }
     It 'version が 1 でなければ終了コード 1 で失敗する' {
         $shared = New-TestShared; $shared['version'] = 2
         $err = { Merge-SsmcConfig -Shared $shared -User ([ordered]@{}) } | Should -Throw -ExpectedMessage '*version*' -PassThru
@@ -242,7 +239,7 @@ Describe 'Config: Get-SsmcSharedConfigPath' {
     }
 }
 
-Describe 'Config: Get-SsmcConfig / Save-SsmcLoginProfile' {
+Describe 'Config: Get-SsmcConfig' {
     BeforeAll {
         $sharedPath = Join-Path $TestDrive 'ssmc.shared.json'
         $sharedJson = @'
@@ -258,7 +255,6 @@ Describe 'Config: Get-SsmcConfig / Save-SsmcLoginProfile' {
     It '個人設定ファイルがなくても読み込める' {
         $config = Get-SsmcConfig -SharedConfigPath $sharedPath -UserConfigPath (Join-Path $TestDrive 'none\ssmc.user.json')
         $config.Environments['dev'].DisplayName | Should -Be '開発'
-        $config.LoginProfile | Should -BeNullOrEmpty
     }
     It 'JSON が壊れていれば終了コード 1 で失敗する' {
         $broken = Join-Path $TestDrive 'broken.json'
@@ -266,19 +262,11 @@ Describe 'Config: Get-SsmcConfig / Save-SsmcLoginProfile' {
         $err = { Get-SsmcConfig -SharedConfigPath $broken -UserConfigPath (Join-Path $TestDrive 'none.json') } | Should -Throw -ExpectedMessage '*broken.json*' -PassThru
         $err.Exception.Data['SsmcExitCode'] | Should -Be 1
     }
-    It 'loginProfile を保存し、既存の設定は残す' {
+    It '個人設定の値で上書きする' {
         $userPath = Join-Path $TestDrive 'user\ssmc.user.json'
         New-Item -ItemType Directory -Path (Split-Path -Parent $userPath) -Force | Out-Null
         Set-Content -LiteralPath $userPath -Value '{ "credentialTtlMinutes": 30 }'
-        Save-SsmcLoginProfile -UserConfigPath $userPath -LoginProfile 'my-login'
-        $config = Get-SsmcConfig -SharedConfigPath $sharedPath -UserConfigPath $userPath
-        $config.LoginProfile | Should -Be 'my-login'
-        $config.CredentialTtlMinutes | Should -Be 30
-    }
-    It '個人設定のフォルダーがなければ作成して保存する' {
-        $userPath = Join-Path $TestDrive 'new\dir\ssmc.user.json'
-        Save-SsmcLoginProfile -UserConfigPath $userPath -LoginProfile 'my-login'
-        Test-Path -LiteralPath $userPath | Should -BeTrue
+        (Get-SsmcConfig -SharedConfigPath $sharedPath -UserConfigPath $userPath).CredentialTtlMinutes | Should -Be 30
     }
 }
 
@@ -423,14 +411,14 @@ Describe 'Auth: Get-SsmcMfaSerial / Get-SsmcCallerIdentity' {
         Mock -ModuleName SsmcCore Invoke-Aws {
             [pscustomobject]@{ ExitCode = 0; StdOut = '{"UserId":"AIDA","Account":"111111111111","Arn":"arn:aws:iam::111111111111:user/taro"}'; StdErr = '' }
         }
-        $identity = Get-SsmcCallerIdentity -LoginProfile 'my-login'
+        $identity = Get-SsmcCallerIdentity -LoginProfile 'my-login' -Region 'ap-northeast-1'
         $identity.Account | Should -Be '111111111111'
         $identity.UserName | Should -Be 'taro'
-        Should -Invoke -ModuleName SsmcCore Invoke-Aws -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'sts get-caller-identity --profile my-login --output json' }
+        Should -Invoke -ModuleName SsmcCore Invoke-Aws -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'sts get-caller-identity --profile my-login --region ap-northeast-1 --output json' }
     }
     It '失敗したら $null を返す' {
         Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 255; StdOut = ''; StdErr = 'The config profile (my-login) could not be found' } }
-        Get-SsmcCallerIdentity -LoginProfile 'my-login' | Should -BeNullOrEmpty
+        Get-SsmcCallerIdentity -LoginProfile 'my-login' -Region 'ap-northeast-1' | Should -BeNullOrEmpty
     }
 }
 
@@ -441,7 +429,7 @@ Describe 'Auth: Connect-SsmcLoginProfile' {
     }
     It 'ログイン済みなら aws login を実行しない' {
         Mock -ModuleName SsmcCore Get-SsmcCallerIdentity { [pscustomobject]@{ Account = '111111111111'; Arn = 'arn'; UserName = 'taro' } }
-        (Connect-SsmcLoginProfile -LoginProfile 'my-login').UserName | Should -Be 'taro'
+        (Connect-SsmcLoginProfile -LoginProfile 'my-login' -Region 'ap-northeast-1').UserName | Should -Be 'taro'
         Should -Invoke -ModuleName SsmcCore Invoke-AwsInteractive -Times 0
     }
     It '未ログインなら aws login を実行して再確認する' {
@@ -449,12 +437,12 @@ Describe 'Auth: Connect-SsmcLoginProfile' {
         $identities.Enqueue($null)
         $identities.Enqueue([pscustomobject]@{ Account = '111111111111'; Arn = 'arn'; UserName = 'taro' })
         Mock -ModuleName SsmcCore Get-SsmcCallerIdentity { $identities.Dequeue() }
-        (Connect-SsmcLoginProfile -LoginProfile 'my-login').UserName | Should -Be 'taro'
-        Should -Invoke -ModuleName SsmcCore Invoke-AwsInteractive -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'login --profile my-login' }
+        (Connect-SsmcLoginProfile -LoginProfile 'my-login' -Region 'ap-northeast-1').UserName | Should -Be 'taro'
+        Should -Invoke -ModuleName SsmcCore Invoke-AwsInteractive -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'login --profile my-login --region ap-northeast-1' }
     }
     It 'aws login 後も確認できなければ終了コード 2 で失敗する' {
         Mock -ModuleName SsmcCore Get-SsmcCallerIdentity { $null }
-        $err = { Connect-SsmcLoginProfile -LoginProfile 'my-login' } | Should -Throw -ExpectedMessage '*ログインに失敗*' -PassThru
+        $err = { Connect-SsmcLoginProfile -LoginProfile 'my-login' -Region 'ap-northeast-1' } | Should -Throw -ExpectedMessage '*ログインに失敗*' -PassThru
         $err.Exception.Data['SsmcExitCode'] | Should -Be 2
     }
 }
@@ -474,54 +462,55 @@ Describe 'Auth: Get-SsmcRoleCredential' {
     It '有効なキャッシュがあれば AssumeRole しない' {
         Mock -ModuleName SsmcCore Read-SsmcCredential { [pscustomobject]@{ SessionToken = 'cached'; Expiration = [DateTimeOffset]::UtcNow.AddMinutes(30) } }
         Mock -ModuleName SsmcCore Invoke-Aws { throw 'should not be called' }
-        (Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive).SessionToken | Should -Be 'cached'
+        (Get-SsmcRoleCredential -Region 'ap-northeast-1' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive).SessionToken | Should -Be 'cached'
         Should -Invoke -ModuleName SsmcCore Connect-SsmcLoginProfile -Times 0
     }
     It '-NoCache ならキャッシュを読まない' {
         Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $successJson; StdErr = '' } }
-        $null = Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive -NoCache
+        $null = Get-SsmcRoleCredential -Region 'ap-northeast-1' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive -NoCache
         Should -Invoke -ModuleName SsmcCore Read-SsmcCredential -Times 0
     }
     It 'セッションタグ・MFA・有効時間を指定して AssumeRole し、結果を保存する' {
         Mock -ModuleName SsmcCore Invoke-Aws { [pscustomobject]@{ ExitCode = 0; StdOut = $successJson; StdErr = '' } }
-        $credential = Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 30 -CacheDirectory $TestDrive
+        $credential = Get-SsmcRoleCredential -Region 'ap-northeast-1' -RoleArn $roleArn -TtlMinutes 30 -CacheDirectory $TestDrive
         $credential.AccessKeyId | Should -Be 'ASIAEXAMPLE'
         $credential.RoleArn | Should -Be $roleArn
         $credential.UserName | Should -Be 'taro'
         $credential.Expiration | Should -BeOfType [DateTimeOffset]
         Should -Invoke -ModuleName SsmcCore Invoke-Aws -Times 1 -ParameterFilter {
             $line = $Arguments -join ' '
-            $line -like 'sts assume-role --profile my-login --role-arn arn:aws:iam::333333333333:role/Operator*' -and
+            $line -like 'sts assume-role --profile ssmc --region ap-northeast-1 --role-arn arn:aws:iam::333333333333:role/Operator*' -and
             $line -like '*--role-session-name taro *' -and
             $line -like '*--serial-number arn:aws:iam::111111111111:mfa/taro --token-code 123456*' -and
             $line -like '*--duration-seconds 1800*' -and
             $line -like '*--tags Key=SSMSessionRunAs,Value=taro*'
         }
         Should -Invoke -ModuleName SsmcCore Save-SsmcCredential -Times 1
+        Should -Invoke -ModuleName SsmcCore Connect-SsmcLoginProfile -Times 1 -ParameterFilter { $LoginProfile -eq 'ssmc' -and $Region -eq 'ap-northeast-1' }
     }
     It 'MFA コードを誤ったら再入力させる' {
         $codes = [System.Collections.Queue]::new(@('111111', '222222', '333333'))
         Mock -ModuleName SsmcCore Read-SsmcMfaCode { $codes.Dequeue() }
         Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'MultiFactorAuthentication failed with invalid MFA one time pass code.' } }
         Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 0; StdOut = $successJson; StdErr = '' } } -ParameterFilter { $MfaCode -eq '333333' }
-        (Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive).AccessKeyId | Should -Be 'ASIAEXAMPLE'
+        (Get-SsmcRoleCredential -Region 'ap-northeast-1' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive).AccessKeyId | Should -Be 'ASIAEXAMPLE'
         Should -Invoke -ModuleName SsmcCore Read-SsmcMfaCode -Times 3 -Exactly
     }
     It 'MFA コードを 3 回誤ったら終了コード 2 で失敗する' {
         Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'MultiFactorAuthentication failed with invalid MFA one time pass code.' } }
-        $err = { Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*3 回*' -PassThru
+        $err = { Get-SsmcRoleCredential -Region 'ap-northeast-1' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*3 回*' -PassThru
         $err.Exception.Data['SsmcExitCode'] | Should -Be 2
         Should -Invoke -ModuleName SsmcCore Read-SsmcMfaCode -Times 3 -Exactly
     }
     It '権限不足はすぐに終了コード 2 で失敗する' {
         Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'An error occurred (AccessDenied) when calling the AssumeRole operation: User is not authorized to perform: sts:TagSession' } }
-        $err = { Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*sts:TagSession*' -PassThru
+        $err = { Get-SsmcRoleCredential -Region 'ap-northeast-1' -RoleArn $roleArn -TtlMinutes 60 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*sts:TagSession*' -PassThru
         $err.Exception.Data['SsmcExitCode'] | Should -Be 2
         Should -Invoke -ModuleName SsmcCore Read-SsmcMfaCode -Times 1 -Exactly
     }
     It '有効時間がロールの上限を超えたら設定の見直しを案内する' {
         Mock -ModuleName SsmcCore Invoke-SsmcAssumeRole { [pscustomobject]@{ ExitCode = 254; StdOut = ''; StdErr = 'An error occurred (ValidationError) when calling the AssumeRole operation: The requested DurationSeconds exceeds the MaxSessionDuration set for this role.' } }
-        { Get-SsmcRoleCredential -LoginProfile 'my-login' -RoleArn $roleArn -TtlMinutes 120 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*credentialTtlMinutes*'
+        { Get-SsmcRoleCredential -Region 'ap-northeast-1' -RoleArn $roleArn -TtlMinutes 120 -CacheDirectory $TestDrive } | Should -Throw -ExpectedMessage '*credentialTtlMinutes*'
     }
 }
 

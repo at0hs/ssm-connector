@@ -26,8 +26,8 @@ aws login のログイン確認 → MFA 入力 → セッションタグ付き A
 1. このフォルダを任意の場所に置きます。
 2. `ssmc.shared.json` に、接続する環境（ロール ARN）が設定されていることを確認します。通常は管理者が配布します（[設定ファイル](#設定ファイル)）。
 3. `ssmc.bat` をダブルクリックするか、PowerShell で `.\ssmc.ps1` を実行します。
-4. 初回だけ、`aws login` で使うプロファイル名を聞かれます。入力した名前は `%APPDATA%\ssmc\ssmc.user.json` に保存されます。
-   プロファイルがまだない、またはログインが切れている場合は、自動で `aws login` が実行されてブラウザが開きます。
+4. 初回、またはログインが切れている場合は、自動で `aws login` が実行されてブラウザが開きます。サインインすると続行します。
+   ssmc は専用のプロファイル `ssmc` を使います（`~/.aws/config` に自動で作られます）。同じ名前のプロファイルをほかの用途で使っている場合は、名前を変えてください。
 5. 環境を選び、MFA コードを入力し、サーバーを選ぶと接続します。
 
 > どこからでも `ssmc` と打って起動したい場合は、このフォルダを環境変数 `PATH` に追加してください（`ssmc.bat` が呼ばれます）。
@@ -92,7 +92,7 @@ PowerShell ISE など、キー入力を直接受け取れない環境では、�
 | ファイル | 置き場所 | 内容 |
 |---|---|---|
 | 共通設定 `ssmc.shared.json` | `ssmc.ps1` と同じフォルダ | 環境の定義、チームで共有するプリセット。管理者が配布します |
-| 個人設定 `ssmc.user.json` | `%APPDATA%\ssmc\` | ログインプロファイル名、個人のプリセット |
+| 個人設定 `ssmc.user.json` | `%APPDATA%\ssmc\` | 個人のプリセット、有効時間の上書き |
 
 ### 共通設定 `ssmc.shared.json`
 
@@ -125,7 +125,6 @@ PowerShell ISE など、キー入力を直接受け取れない環境では、�
 
 ```json
 {
-  "loginProfile": "my-login",
   "credentialTtlMinutes": 30,
   "presets": {
     "prod-web01": { "env": "prod", "target": { "name": "web01" } }
@@ -135,7 +134,6 @@ PowerShell ISE など、キー入力を直接受け取れない環境では、�
 
 | 項目 | 必須 | 説明 |
 |---|---|---|
-| `loginProfile` | ○ | `aws login --profile` に渡すプロファイル名。初回起動時に入力すると自動で保存されます |
 | `credentialTtlMinutes` | − | 共通設定の値を上書きします |
 | `presets` | − | 個人のプリセット |
 
@@ -289,4 +287,4 @@ bash test-env/test-env.sh down     # EC2 だけ削除する（ロールなどは
 bash test-env/test-env.sh destroy  # すべて削除する
 ```
 
-`up` は、テスト用の共通設定 `ssmc.shared.test.json` も作ります。このファイルがあると、ssmc は `ssmc.shared.json` の代わりにそちらを読みます。Git には登録されません。プロファイルは `ssmc-admin` を使います。別のプロファイルを使う場合は、環境変数 `SSMC_TEST_PROFILE` で指定してください。
+`up` は、テスト用の共通設定 `ssmc.shared.test.json` も作ります。このファイルがあると、ssmc は `ssmc.shared.json` の代わりにそちらを読みます。Git には登録されません。スクリプトは AWS の操作にプロファイル `ssmc-admin` を使います。別のプロファイルを使う場合は、環境変数 `SSMC_TEST_PROFILE` で指定してください（ssmc 本体が使う `ssmc` プロファイルとは別です）。
