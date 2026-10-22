@@ -226,6 +226,22 @@ Describe 'Config: Merge-SsmcConfig' {
     }
 }
 
+Describe 'Config: Get-SsmcSharedConfigPath' {
+    It 'テスト用の共通設定がなければ ssmc.shared.json を返す' {
+        $dir = Join-Path $TestDrive 'normal'
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        Set-Content -LiteralPath (Join-Path $dir 'ssmc.shared.json') -Value '{}'
+        Get-SsmcSharedConfigPath -Directory $dir | Should -Be (Join-Path $dir 'ssmc.shared.json')
+    }
+    It 'ssmc.shared.test.json があればそちらを返す' {
+        $dir = Join-Path $TestDrive 'withtest'
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        Set-Content -LiteralPath (Join-Path $dir 'ssmc.shared.json') -Value '{}'
+        Set-Content -LiteralPath (Join-Path $dir 'ssmc.shared.test.json') -Value '{}'
+        Get-SsmcSharedConfigPath -Directory $dir | Should -Be (Join-Path $dir 'ssmc.shared.test.json')
+    }
+}
+
 Describe 'Config: Get-SsmcConfig / Save-SsmcLoginProfile' {
     BeforeAll {
         $sharedPath = Join-Path $TestDrive 'ssmc.shared.json'

@@ -171,6 +171,14 @@ function Add-SsmcPluginToPath {
 #endregion
 
 #region Config
+function Get-SsmcSharedConfigPath {
+    # 実機確認用の ssmc.shared.test.json があれば、配布用の ssmc.shared.json より優先する
+    param([Parameter(Mandatory)][string]$Directory)
+    $testPath = Join-Path $Directory 'ssmc.shared.test.json'
+    if (Test-Path -LiteralPath $testPath) { return $testPath }
+    return (Join-Path $Directory 'ssmc.shared.json')
+}
+
 function Get-SsmcUserConfigPath {
     return (Join-Path $env:APPDATA 'ssmc\ssmc.user.json')
 }

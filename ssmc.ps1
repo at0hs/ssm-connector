@@ -54,7 +54,10 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'lib\SsmcCore.psm1') -Force -Verbose:$false
 Import-Module (Join-Path $PSScriptRoot 'lib\SsmcMenu.psm1') -Force -Verbose:$false
 
-$sharedConfigPath = Join-Path $PSScriptRoot 'ssmc.shared.json'
+$sharedConfigPath = Get-SsmcSharedConfigPath -Directory $PSScriptRoot
+if ((Split-Path -Leaf $sharedConfigPath) -ne 'ssmc.shared.json') {
+    Write-Host "テスト用の共通設定を使用します: $(Split-Path -Leaf $sharedConfigPath)" -ForegroundColor DarkYellow
+}
 $userConfigPath = Get-SsmcUserConfigPath
 $cacheDirectory = Get-SsmcCacheDirectory
 

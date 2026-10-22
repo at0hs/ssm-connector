@@ -307,6 +307,8 @@ ssmc [[-Preset] <名前>] [-Env <環境キー>] [-Target <Name または Instanc
 | `environments.<key>.region` | − | その環境のリージョン（省略時は `defaults.region`） |
 | `presets` | − | チームで共有するプリセット（形式は §6.3） |
 
+同じフォルダに `ssmc.shared.test.json` があれば、`ssmc.shared.json` の代わりにそちらを読み、起動時にその旨を表示する。実機確認用で、`test-env/test-env.sh up` が生成する（`.gitignore` 済み）。
+
 ### 6.2 個人設定 `%APPDATA%\ssmc\ssmc.user.json`
 
 ```json
