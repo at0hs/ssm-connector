@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: ssmc test environment (env roles, Session Manager preferences, optional EC2 x2)
+
+Parameters:
+  UserName:
+    Type: String
+    Default: developer
+    Description: IAM user who runs ssmc (also the Run As OS user)
+  Instances:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Create the two test EC2 instances
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet with a route to the internet (public IP is assigned)
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  InstanceType:
+    Type: String
+    Default: t4g.nano
+
+Conditions:
+  CreateInstances: !Equals [!Ref Instances, "true"]
+
+Resources:
+  # Environment roles ssmc-dev / ssmc-stg / ssmc-prod:
+  # MFA required, SSMSessionRunAs limited to the caller's own user name
+  Fn::ForEach::EnvRoles:
+    - Env
+    - [dev, stg, prod]
+    - "${Env}Role":
+        Type: AWS::IAM::Role
+        Properties:
+          RoleName: !Sub "ssmc-${Env}"
+          AssumeRolePolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:user/${UserName}" }
+                Action: sts:AssumeRole
+                Condition: { Bool: { aws:MultiFactorAuthPresent: "true" } }
+              - Effect: Allow
+                Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:user/${UserName}" }
+                Action: sts:TagSession
+                Condition:
+                  Bool: { aws:MultiFactorAuthPresent: "true" }
+                  StringEquals: { aws:RequestTag/SSMSessionRunAs: "${aws:username}" }
+                  ForAllValues:StringEquals: { aws:TagKeys: [SSMSessionRunAs] }
+          Policies:
+            - PolicyName: ssmc-operator
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action: [ec2:DescribeInstances, ssm:DescribeInstanceInformation]
+                    Resource: "*"
+                  - Effect: Allow
+                    Action: ssm:StartSession
+                    Resource:
+                      - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                      - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/SSM-SessionManagerRunShell"
+                      - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-StartPortForwardingSession"
+                      - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-StartPortForwardingSessionToRemoteHost"
+                  - Effect: Allow
+                    Action: [ssm:TerminateSession, ssm:ResumeSession]
+                    Resource: !Sub "arn:aws:ssm:*:${AWS::AccountId}:session/*"
+
+  # Session Manager preferences with Run As enabled
+  SessionPreferences:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: SSM-SessionManagerRunShell
+      DocumentType: Session
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: "1.0"
+        description: "ssmc test: Session Manager preferences"
+        sessionType: Standard_Stream
+        inputs:
+          s3BucketName: ""
+          s3KeyPrefix: ""
+          s3EncryptionEnabled: true
+          cloudWatchLogGroupName: ""
+          cloudWatchEncryptionEnabled: true
+          cloudWatchStreamingEnabled: false
+          kmsKeyId: ""
+          runAsEnabled: true
+          runAsDefaultUser: ""
+          idleSessionTimeout: "20"
+          shellProfile: { windows: "", linux: "" }
+
+  # Instance role for SSM
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ssmc-ec2-ssm
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: ssmc-ec2-ssm
+      Roles: [!Ref Ec2Role]
+
+  # Inbound 22 from the same SG only (for port forwarding via RemoteHost)
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ssmc-test-sg
+      GroupDescription: ssmc test
+      VpcId: !Ref VpcId
+  SecurityGroupSelfSsh:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: ssmc-test
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt Ec2InstanceProfile.Arn }
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: !Ref SubnetId
+            Groups: [!Ref SecurityGroup]
+            AssociatePublicIpAddress: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            id ${UserName} >/dev/null 2>&1 || useradd -m -s /bin/bash ${UserName}
+
+  # Instances exist only while Instances=true
+  Web01:
+    Type: AWS::EC2::Instance
+    Condition: CreateInstances
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags: [{ Key: Name, Value: ssmc-web01 }]
+  Db01:
+    Type: AWS::EC2::Instance
+    Condition: CreateInstances
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags: [{ Key: Name, Value: ssmc-db01 }]
+
+Outputs:
+  Fn::ForEach::EnvRoleArns:
+    - Env
+    - [dev, stg, prod]
+    - "${Env}RoleArn":
+        Value: !GetAtt [!Sub "${Env}Role", Arn]
+  Db01PrivateIp:
+    Condition: CreateInstances
+    Value: !GetAtt Db01.PrivateIp

@@ -263,6 +263,7 @@ ssm-connector/
 │   ├─ SsmcCore.psm1       # aws の呼び出し、事前チェック、設定、キャッシュ、認証、一覧、接続、ヘルプ
 │   └─ SsmcMenu.psm1       # 矢印キーの選択 UI、番号入力方式、y/N 確認
 ├─ tests/                  # Pester のテスト
+├─ test-env/               # 実機確認用の AWS 環境（CloudFormation）
 └─ ssm-connector-design.md # 設計書
 ```
 
@@ -276,3 +277,16 @@ ssm-connector/
 pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pester -Path tests -Output Detailed"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pester -Path tests -Output Detailed"
 ```
+
+### 実機確認用の環境
+
+`test-env/` の CloudFormation テンプレートで、環境ロール 3 つ（`ssmc-dev` / `ssmc-stg` / `ssmc-prod`）と、接続先の EC2 2 台（`ssmc-web01` / `ssmc-db01`）を作れます。Git Bash で実行します。
+
+```bash
+bash test-env/test-env.sh up       # EC2 を作る（初回はロールなども作る）
+bash test-env/test-env.sh status   # EC2 と SSM の状態を表示する
+bash test-env/test-env.sh down     # EC2 だけ削除する（ロールなどは残す）
+bash test-env/test-env.sh destroy  # すべて削除する
+```
+
+`up` は、テスト用の共通設定 `ssmc.shared.test.json` も作ります。このファイルがあると、ssmc は `ssmc.shared.json` の代わりにそちらを読みます。Git には登録されません。プロファイルは `ssmc-admin` を使います。別のプロファイルを使う場合は、環境変数 `SSMC_TEST_PROFILE` で指定してください。

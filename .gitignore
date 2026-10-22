@@ -1,0 +1,2 @@
+# 実機確認用の共通設定（test-env/test-env.sh up が生成する）
+ssmc.*test.json
