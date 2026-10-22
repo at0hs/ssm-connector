@@ -52,10 +52,7 @@ function ConvertTo-SsmcArgumentString {
 
 function Format-SsmcAwsCommandLine {
     param([string[]]$Arguments)
-    $masked = for ($i = 0; $i -lt $Arguments.Count; $i++) {
-        if ($i -gt 0 -and $Arguments[$i - 1] -eq '--token-code') { '******' } else { $Arguments[$i] }
-    }
-    return 'aws ' + ($masked -join ' ')
+    return 'aws ' + ($Arguments -join ' ')
 }
 
 function Get-SsmcAwsPath {
@@ -541,8 +538,8 @@ function Connect-SsmcLoginProfile {
 
 function Read-SsmcMfaCode {
     while ($true) {
-        $secure = Read-Host -Prompt 'MFAコード（6桁）' -AsSecureString
-        $code = [System.Net.NetworkCredential]::new('', $secure).Password
+        # 30 秒で無効になる値なので、入力内容は伏せない
+        $code = ([string](Read-Host -Prompt 'MFAコード（6桁）')).Trim()
         if ($code -match '^\d{6}$') { return $code }
         Write-Host '6桁の数字で入力してください。' -ForegroundColor Yellow
     }

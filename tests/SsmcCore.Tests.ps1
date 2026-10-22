@@ -27,9 +27,9 @@ Describe 'AwsCli: ConvertTo-SsmcArgumentString' {
 }
 
 Describe 'AwsCli: Format-SsmcAwsCommandLine' {
-    It '--token-code の値を伏せ字にする' {
+    It '引数をそのまま並べる（MFA コードも伏せない）' {
         Format-SsmcAwsCommandLine @('sts', 'assume-role', '--token-code', '123456', '--output', 'json') |
-            Should -Be 'aws sts assume-role --token-code ****** --output json'
+            Should -Be 'aws sts assume-role --token-code 123456 --output json'
     }
 }
 

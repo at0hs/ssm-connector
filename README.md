@@ -49,7 +49,7 @@ ssmc [プリセット名] [-Env <環境>] [-Target <Name|InstanceId>]
 | ポートフォワードする | `ssmc -Env prod -LocalPort 15432 -RemotePort 5432 -RemoteHost mydb.example.internal` | 経由するサーバー（踏み台）を選び、`localhost:15432` から転送します |
 | MFA から取り直す | `ssmc prod-web01 -NoCache` | キャッシュを使いません |
 | キャッシュを削除する | `ssmc -ClearCache` | 保存した認証情報をすべて削除します |
-| 実行する aws コマンドを表示する | `ssmc -Verbose` | MFA コードは `******` で伏せられます |
+| 実行する aws コマンドを表示する | `ssmc -Verbose` | |
 | ヘルプを表示する | `ssmc --help` | 使い方と、定義済みの環境・プリセットの一覧を表示します |
 
 - `-RemoteHost` を省略すると、選んだサーバー自身の `-RemotePort` へ転送します。

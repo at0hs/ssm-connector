@@ -189,7 +189,7 @@ ssmc [[-Preset] <名前>] [-Env <環境キー>] [-Target <Name または Instanc
 1. `aws sts get-caller-identity --profile <loginProfile>` を実行する。
    - 失敗した場合（プロファイルがない／ログインが切れている）は「ブラウザでログインします」と表示して `aws login --profile <loginProfile>` を実行し、もう一度確認する。2 回目も失敗したら終了コード 2 で終了する。
 2. 結果の `Arn` から末尾をユーザー名として取り出し、`Account` と組み合わせて MFA シリアル `arn:aws:iam::<Account>:mfa/<UserName>` を組み立てる。
-3. MFA コードを入力してもらう。6 桁の数字でなければその場で再入力させる。入力は画面に表示しない。
+3. MFA コードを入力してもらう。6 桁の数字でなければその場で再入力させる。30 秒で無効になる値のため、入力は画面に表示する。
 4. 次のコマンドで AssumeRole する。
 
    ```
@@ -377,7 +377,7 @@ ssmc [[-Preset] <名前>] [-Env <環境キー>] [-Target <Name または Instanc
 ### 7.3 秘密情報とログ
 
 - MFA コードとクレデンシャルは画面にもログにも出力しない。
-- `-Verbose` 指定時だけ、実行した aws コマンドを表示する。その際 `--token-code` の値は伏せ字にする。
+- `-Verbose` 指定時だけ、実行した aws コマンドを表示する。MFA コード（`--token-code`）も伏せない。
 - ファイルへのログ出力は行わない（作業の監査は SSM 側のログで担保されているため）。
 
 ---
